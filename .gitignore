@@ -1,0 +1,4 @@
+build/
+.wwebjs_auth
+qr-data.txt
+.env

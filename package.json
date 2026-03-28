@@ -1,0 +1,18 @@
+{
+  "name": "family-whatsapp-bot",
+  "version": "1.0.0",
+  "description": "Family WhatsApp AI Assistant — whatsapp-web.js edition",
+  "main": "src/bot.js",
+  "scripts": {
+    "build": "rm -rf build && mkdir -p build && cp -R src/* build/",
+    "start": "npm run build && node build/bot.js",
+    "dev": "node --watch src/bot.js"
+  },
+  "dependencies": {
+    "dotenv":           "^16.4.0",
+    "node-cron":        "^3.0.3",
+    "openai":           "^4.50.0",
+    "qrcode-terminal":  "^0.12.0",
+    "whatsapp-web.js":  "^1.23.0"
+  }
+}
