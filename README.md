@@ -65,15 +65,14 @@ npm install
 
 ```bash
 npm install -g pm2
-npm run start   # uses build/bot.js
-pm2 start build/bot.js --name fam-bot
+pm2 start src/bot.js --name fam-bot
 pm2 save
 pm2 startup
 ```
 
 ## PM2 commands
 
-- `pm2 start bot.js --name fam-bot`
+- `pm2 start src/bot.js --name fam-bot`
 - `pm2 stop fam-bot`
 - `pm2 restart fam-bot`
 - `pm2 delete fam-bot`

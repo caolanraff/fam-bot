@@ -2,3 +2,4 @@ build/
 .wwebjs_auth
 qr-data.txt
 .env
+.DS_Store
