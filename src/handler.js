@@ -152,7 +152,7 @@ RULES:
     ];
 
     const res = await openai.chat.completions.create({
-        model:           'anthropic/claude-3.5-sonnet',
+        model:           process.env.OPENAI_MODEL,
         messages,
         response_format: { type: 'json_object' },
         temperature:     0.2,
