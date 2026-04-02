@@ -482,7 +482,7 @@ function buildSummary() {
     // Events in the next 48 hours (not today)
     const soon = (calRec.events || []).filter(e => {
         const diff = (new Date(e.date + 'T12:00:00') - now) / 86400000;
-        return diff > 0 && diff <= 2;
+        return diff > 0 && diff <= 2 && e.date !== todayStr;
     });
     if (soon.length) {
         hasContent = true;
