@@ -156,6 +156,7 @@ RULES:
         messages,
         response_format: { type: 'json_object' },
         temperature:     0.2,
+        max_tokens: 1024,
     });
 
     return JSON.parse(res.choices[0].message.content);
