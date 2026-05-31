@@ -4,43 +4,74 @@ const fs   = require('fs');
 const path = require('path');
 
 const DATA_FILE = path.join(__dirname, 'data.json');
+const TMP_FILE  = DATA_FILE + '.tmp';
 
 const DEFAULTS = {
-    calendar: { events:  [] },
-    todo:     { items:   [] },
-    shopping: { items:   [] },
-    meals:    { plan:    {} },
-    history:  { messages:[] },
+    calendar: { events: [] },
+    todo:     { items:  [] },
+    shopping: { items:  [] },
+    meals:    { plan:   {} },
 };
 
-function readAll() {
+let cache       = null;   // in-memory mirror of data.json
+let writeQueued = false;  // debounce flag
+
+function clone(v) { return JSON.parse(JSON.stringify(v)); }
+
+function loadFromDisk() {
     try {
         if (!fs.existsSync(DATA_FILE)) {
             fs.writeFileSync(DATA_FILE, JSON.stringify(DEFAULTS, null, 2));
-            return JSON.parse(JSON.stringify(DEFAULTS));
+            return clone(DEFAULTS);
         }
         const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-        // Merge with defaults so new keys are never missing
-        return { ...JSON.parse(JSON.stringify(DEFAULTS)), ...parsed };
+        return { ...clone(DEFAULTS), ...parsed };
     } catch (err) {
-        console.error('[storage] Read error:', err.message);
-        return JSON.parse(JSON.stringify(DEFAULTS));
+        console.error('[storage] read error:', err.message);
+        return clone(DEFAULTS);
     }
 }
 
-function writeAll(data) {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+function ensureLoaded() {
+    if (cache === null) cache = loadFromDisk();
+    return cache;
+}
+
+// Atomic write: write to .tmp then rename, so a crash mid-write
+// can never leave a half-written data.json
+function flush() {
+    try {
+        fs.writeFileSync(TMP_FILE, JSON.stringify(cache, null, 2));
+        fs.renameSync(TMP_FILE, DATA_FILE);
+    } catch (err) {
+        console.error('[storage] write error:', err.message);
+    } finally {
+        writeQueued = false;
+    }
+}
+
+// Debounce writes within the same tick — multiple set() calls in one
+// handler invocation become one disk write.
+function scheduleFlush() {
+    if (writeQueued) return;
+    writeQueued = true;
+    setImmediate(flush);
 }
 
 function get(key) {
-    const data = readAll();
-    return data[key] ?? JSON.parse(JSON.stringify(DEFAULTS[key] ?? {}));
+    const data = ensureLoaded();
+    return data[key] ?? clone(DEFAULTS[key] ?? {});
 }
 
 function set(key, value) {
-    const data = readAll();
+    const data = ensureLoaded();
     data[key] = value;
-    writeAll(data);
+    scheduleFlush();
 }
 
-module.exports = { get, set };
+// Optional: force a synchronous flush (e.g. on shutdown)
+function flushNow() {
+    if (writeQueued) flush();
+}
+
+module.exports = { get, set, flushNow };
