@@ -36,7 +36,7 @@ function looksLikeList(text) {
   if (!text) return false;
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   if (lines.length < 2) return false;
-  const bulletLines = lines.filter(l => /^([-*•⁠]\s|\d+[.)]\s)/.test(l)).length;
+  const bulletLines = lines.filter(l => /^([-*•]\s|\d+[.)]\s)/.test(l)).length;
   return bulletLines >= 2;
 }
 
@@ -58,13 +58,30 @@ async function processMessage(client, msg, session) {
   const userText = msg.body?.trim();
   if (!userText) return;
 
+  // ── Pull quoted-message text if the user used WhatsApp's reply feature ──
+  let quotedText = null;
+  if (msg.hasQuotedMsg) {
+    try {
+      const q = await msg.getQuotedMessage();
+      const body = (q?.body || '').trim();
+      if (body) {
+        quotedText = body.length > 1500 ? body.slice(0, 1500) + '…' : body;
+      }
+    } catch (err) {
+      console.warn('[bot] could not fetch quoted message:', err.message);
+    }
+  }
+
   let senderName = 'there';
   try {
     const c = await msg.getContact();
     senderName = c.pushname || c.name || senderName;
   } catch {}
 
-  console.log(`[${new Date().toISOString()}] ${senderName}: "${userText}"`);
+  console.log(
+    `[${new Date().toISOString()}] ${senderName}: "${userText}"` +
+    (quotedText ? ` (replying to: "${quotedText.slice(0, 60)}…")` : '')
+  );
 
   let reply;
   try {
@@ -87,7 +104,6 @@ async function processMessage(client, msg, session) {
         session.pendingAction = null;
         reply = '👍 Cancelled — pick aborted.';
       }
-      // else fall through; we'll let the LLM handle it but drop the pending pick
       else {
         session.pendingAction = null;
       }
@@ -101,7 +117,6 @@ async function processMessage(client, msg, session) {
         session.pendingAction = null;
         reply = '👍 Cancelled — nothing changed.';
       } else {
-        // unrelated message — drop the pending and continue parsing
         session.pendingAction = null;
       }
     }
@@ -111,18 +126,15 @@ async function processMessage(client, msg, session) {
     }
 
     if (!reply) {
-      const parsed = await parseIntent(userText, session, senderName);
+      const parsed = await parseIntent(userText, session, senderName, quotedText);
       const { intent, data, reply: aiReply } = parsed;
       console.log(`[bot] intent=${intent}`, JSON.stringify(data));
 
       // ── Bare-list fallback ──
-      // If the LLM gave up but the message looks like a list of events,
-      // offer to add them to the calendar rather than silently ignore.
-      if (intent === 'unknown' && looksLikeList(userText)) {
+      if (intent === 'unknown' && !quotedText && looksLikeList(userText)) {
         const original = userText;
         setPending(session, {
           fn: async () => {
-            // Re-parse with an explicit calendar hint
             const hinted = `Add to calendar:\n${original}`;
             const reparsed = await parseIntent(hinted, session, senderName);
             console.log(`[bot] list-fallback intent=${reparsed.intent}`,
@@ -138,7 +150,6 @@ async function processMessage(client, msg, session) {
 
     if (!reply) reply = "Done! ✅";
 
-    // Persist last few turns inside session for LLM context
     session.history.push({ role: 'assistant', content: reply.replace(/\*/g, '') });
     if (session.history.length > 20) session.history.shift();
 
@@ -203,12 +214,34 @@ async function dispatchIntent(intent, data, session, aiReply) {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Robust JSON extraction — strips ```json ... ``` fences and any
+// stray prose around the JSON object so JSON.parse can't trip on
+// them.
+// ─────────────────────────────────────────────────────────────────
+function extractJson(raw) {
+  if (typeof raw !== 'string') return raw;
+  let s = raw.trim();
+
+  // Strip an outer ```json ... ``` or ``` ... ``` fence if present
+  const fence = s.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```\s*$/i);
+  if (fence) s = fence[1].trim();
+
+  // Some providers prepend a "json" word or other noise — find the
+  // first { and the last } and take what's between them.
+  const first = s.indexOf('{');
+  const last  = s.lastIndexOf('}');
+  if (first !== -1 && last !== -1 && last > first) {
+    s = s.slice(first, last + 1);
+  }
+  return s;
+}
+
+// ─────────────────────────────────────────────────────────────────
 // LLM intent parser — session-aware, with safe JSON parsing
 // ─────────────────────────────────────────────────────────────────
-async function parseIntent(userMessage, session, senderName) {
+async function parseIntent(userMessage, session, senderName, quotedText = null) {
   const now = new Date();
 
-  // Snapshot of current state to ground the LLM
   const events  = (get('calendar').events || []).slice(0, 15);
   const todos   = (get('todo').items     || []).filter(i => !i.done).slice(0, 10);
   const shop    = (get('shopping').items || []).filter(i => !i.checked).slice(0, 15);
@@ -230,7 +263,7 @@ Today is ${now.toDateString()} (${contextSnapshot.weekday}).
 CURRENT STATE (use this to resolve references like "the staff party", "that one", "item 2"):
 ${JSON.stringify(contextSnapshot, null, 2)}
 
-Respond ONLY with valid JSON in this exact shape:
+Respond ONLY with valid JSON in this exact shape — NO markdown fences, NO code blocks, NO commentary:
 { "intent": string, "data": object, "reply": string }
 
 INTENTS:
@@ -239,26 +272,29 @@ Calendar
   add_event
     SINGLE: { title, date (YYYY-MM-DD), time ("HH:MM" 24h, optional), notes (optional) }
     BATCH:  { events: [ { title, date, time?, notes? }, ... ] }
-    → Use BATCH whenever the user gives more than one event in one message
-      (bullet list, numbered list, "and", multiple lines, etc.).
+    → Use BATCH whenever the user gives more than one event in one message.
     → A bare list of dated items (even without an explicit "add to calendar")
       should be treated as add_event BATCH.
   update_event  → { match: string OR index: number,
                     changes: { title?, date?, time?, notes? } }
-                  Use this when user says "move", "reschedule", "change", "rename", "push back".
   remove_event  → { match: string OR index: number }
   view_calendar → {}
 
 To-Do
-  add_todo        → { item: string }
+  add_todo
+    SINGLE: { item: string }
+    BATCH:  { items: [ { item: string }, ... ]  OR  [ string, ... ] }
+    → Use BATCH whenever the user gives more than one to-do in one message
+      (bullet list, numbered list, "and", multiple lines, etc.).
   complete_todo   → { index: number } OR { item: string }
   remove_todo     → { index: number } OR { item: string }
   clear_completed → {}
   view_todo       → {}
 
 Shopping
-  add_shopping    → single: { item, quantity? }
-                    multiple: { items: [{ item, quantity? }, ...] }
+  add_shopping
+    SINGLE: { item, quantity? }
+    BATCH:  { items: [ { item, quantity? }, ... ] }
   remove_shopping → { index: number } OR { item: string }
   check_shopping  → { index: number } OR { item: string }
   clear_shopping  → {}
@@ -272,6 +308,31 @@ Meal Plan
 Other
   summary, help, confirm, cancel, undo, unknown → { }
 
+REPLY-CONTEXT HANDLING (IMPORTANT):
+The user's turn may arrive in two parts:
+  REPLYING_TO: "<text of the message they tapped reply on>"
+  USER_MESSAGE: "<the new text they actually typed>"
+
+When this happens:
+- The ACTION verb always comes from USER_MESSAGE, never from REPLYING_TO.
+- Treat REPLYING_TO purely as context — it tells you which list/item the user
+  is referring to. Do not re-parse the items inside it as new commands.
+- If REPLYING_TO starts with an emoji header, that identifies the list:
+    🛒 → shopping list   📝 → to-do list   📅 → calendar   🍽️ → meal plan
+- Examples:
+    REPLYING_TO: "🛒 Shopping List: ..."   USER_MESSAGE: "clear"
+      → { "intent": "clear_shopping", "data": {} }
+    REPLYING_TO: "🛒 Shopping List: ..."   USER_MESSAGE: "remove eggs"
+      → { "intent": "remove_shopping", "data": { "item": "eggs" } }
+    REPLYING_TO: "📝 To-Do List: ..."      USER_MESSAGE: "clear them all"
+      → { "intent": "clear_completed", "data": {} } if "all" means completed,
+        otherwise ask via "unknown" only as last resort.
+    REPLYING_TO: "📅 Upcoming Events: ..." USER_MESSAGE: "delete #2"
+      → { "intent": "remove_event", "data": { "index": 2 } }
+    REPLYING_TO: "<event details>"         USER_MESSAGE: "move to friday 3pm"
+      → { "intent": "update_event", "data": { "match": "<title from REPLYING_TO>", "changes": { ... } } }
+- If USER_MESSAGE alone is enough (e.g. "show calendar"), ignore REPLYING_TO.
+
 RULES:
 - Convert relative dates ("tomorrow", "next Friday", "in 3 days", "Tuesday 2nd")
   to YYYY-MM-DD using today's date as the anchor. Always pick the NEAREST
@@ -279,27 +340,45 @@ RULES:
 - For references like "the staff party" or "the dentist", set match to the
   user's exact phrase — the code will fuzzy-match against the events list above.
 - If the user says "move X to Friday at 3", that is update_event, NOT remove + add.
-- If multiple shopping items in one message, use the items array.
+- If multiple shopping/to-do items in one message, use the items array.
 - "reply" is a short friendly fallback only — actual reply text is generated by code.
 - A bare "yes"/"no"/"ok" should be intent confirm or cancel.
 - Prefer a real intent over "unknown". Only return "unknown" for genuine
   small-talk or when the message has no actionable content at all.
+- OUTPUT FORMAT: Return the JSON object directly. Do NOT wrap it in
+  \`\`\`json fences or any other markdown.
 
 EXAMPLES:
 
+User: "Add to todo list:
+- new cushions
+- new bedsheets
+- artwork for bedroom"
+
+Output:
+{
+  "intent": "add_todo",
+  "data": {
+    "items": [
+      { "item": "new cushions" },
+      { "item": "new bedsheets" },
+      { "item": "artwork for bedroom" }
+    ]
+  },
+  "reply": ""
+}
+
 User: "Add to calendar:
 - Out for dinner Tuesday 2nd
-- Railway cup Saturday 6th
-- Raffo's pool morning Sunday 7th"
+- Railway cup Saturday 6th"
 
-Output (assuming today is Mon 1 Jun 2026):
+Output:
 {
   "intent": "add_event",
   "data": {
     "events": [
-      { "title": "Out for dinner",      "date": "2026-06-02" },
-      { "title": "Railway cup",         "date": "2026-06-06" },
-      { "title": "Raffo's pool morning","date": "2026-06-07" }
+      { "title": "Out for dinner", "date": "<tuesday-2nd>" },
+      { "title": "Railway cup",    "date": "<saturday-6th>" }
     ]
   },
   "reply": ""
@@ -309,7 +388,16 @@ User: "dentist friday at 2pm"
 Output: { "intent": "add_event", "data": { "title": "dentist", "date": "<next-friday>", "time": "14:00" }, "reply": "" }
 
 User: "move the staff party to next saturday"
-Output: { "intent": "update_event", "data": { "match": "staff party", "changes": { "date": "<next-saturday>" } }, "reply": "" }`;
+Output: { "intent": "update_event", "data": { "match": "staff party", "changes": { "date": "<next-saturday>" } }, "reply": "" }
+
+User (with reply):
+REPLYING_TO: "🛒 Shopping List: 1. milk  2. bread  3. eggs"
+USER_MESSAGE: "clear"
+Output: { "intent": "clear_shopping", "data": {}, "reply": "" }`;
+
+  const userTurnContent = quotedText
+    ? `REPLYING_TO:\n"""\n${quotedText}\n"""\n\nUSER_MESSAGE:\n${userMessage}`
+    : userMessage;
 
   const messages = [
     { role: 'system', content: systemPrompt },
@@ -317,7 +405,7 @@ Output: { "intent": "update_event", "data": { "match": "staff party", "changes":
       role: h.role === 'assistant' ? 'assistant' : 'user',
       content: typeof h.content === 'string' ? h.content : (h.body || '')
     })),
-    { role: 'user', content: userMessage },
+    { role: 'user', content: userTurnContent },
   ];
 
   let raw;
@@ -335,21 +423,33 @@ Output: { "intent": "update_event", "data": { "match": "staff party", "changes":
     return { intent: 'unknown', data: {}, reply: "I'm having trouble reaching my brain right now — try again in a moment?" };
   }
 
+  // Try strict parse first; fall back to fence-stripping if it fails.
+  let parsed;
   try {
-    const parsed = JSON.parse(raw);
+    parsed = JSON.parse(raw);
+  } catch {
+    try {
+      parsed = JSON.parse(extractJson(raw));
+      console.log('[bot] recovered JSON after stripping wrapper');
+    } catch (e2) {
+      console.error('[bot] LLM returned non-JSON:', raw);
+      return { intent: 'unknown', data: {}, reply: "Sorry, I got confused — could you rephrase?" };
+    }
+  }
+
+  try {
     if (!parsed || typeof parsed !== 'object' || typeof parsed.intent !== 'string') {
       throw new Error('parsed JSON missing intent');
     }
     parsed.data  = parsed.data  || {};
     parsed.reply = parsed.reply || '';
 
-    // Log raw output when the model gives up — helps diagnose schema mismatches
     if (parsed.intent === 'unknown') {
       console.log('[bot] LLM returned unknown. raw:', raw);
     }
     return parsed;
   } catch (e) {
-    console.error('[bot] LLM returned non-JSON:', raw);
+    console.error('[bot] LLM JSON missing required fields:', raw);
     return { intent: 'unknown', data: {}, reply: "Sorry, I got confused — could you rephrase?" };
   }
 }
@@ -373,7 +473,6 @@ function performUndo(session) {
   return `↩️  ${result}`;
 }
 
-// Token-overlap score: handles "staff party" → "Annual Staff Christmas Party"
 function fuzzyScore(query, candidate) {
   const q = query.toLowerCase().split(/\W+/).filter(Boolean);
   const c = candidate.toLowerCase();
@@ -389,7 +488,6 @@ function bestMatches(query, list, getText, threshold = 0.5) {
     .sort((a, b) => b.score - a.score);
 }
 
-// Validation helpers
 function isValidYMD(s) {
   if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
   const d = new Date(s + 'T12:00:00');
@@ -422,7 +520,6 @@ function handleCalendar(intent, data, session) {
   const events = rec.events || [];
 
   if (intent === 'add_event') {
-    // ── Batch path: multiple events in one message ──
     if (Array.isArray(data.events) && data.events.length) {
       const added  = [];
       const errors = [];
@@ -479,7 +576,6 @@ function handleCalendar(intent, data, session) {
       return out;
     }
 
-    // ── Single-event path ──
     if (!data.title || typeof data.title !== 'string') {
       return `❌ I didn't catch the event title — try again?`;
     }
@@ -524,14 +620,12 @@ function handleCalendar(intent, data, session) {
     const found = resolveEvent(events, data);
     if (found.error) return found.error;
     if (found.ambiguous) {
-      // Stash the user's intended changes so a numeric reply completes the action
       const candidates = found.candidates;
       const pendingChanges = data.changes || {};
       setPending(session, {
         pickFromList: (n) => {
           const ev = candidates[n - 1];
           if (!ev) return `❌ ${n} isn't on the list — try again or say *cancel*.`;
-          // Re-fetch fresh events list and find this event by id
           const freshEvents = get('calendar').events || [];
           const idx = freshEvents.findIndex(e => e.id === ev.id);
           if (idx === -1) return `❌ That event seems to be gone now.`;
@@ -545,7 +639,6 @@ function handleCalendar(intent, data, session) {
     const before  = { ...ev };
     const changes = data.changes || {};
 
-    // Validate any incoming changes
     if (changes.date !== undefined && !isValidYMD(changes.date)) {
       return `❌ "${changes.date}" isn't a valid date.`;
     }
@@ -652,7 +745,6 @@ function sortEvents(events) {
   );
 }
 
-// Resolve { match, index } against events list with fuzzy matching + disambiguation
 function resolveEvent(events, data) {
   if (!events.length) return { error: `📅 Calendar is empty.` };
 
@@ -670,7 +762,6 @@ function resolveEvent(events, data) {
     return { error: `❌ Couldn't find an event matching "${query}". Say *show calendar* to see your list.` };
   }
 
-  // Single clear winner if top score is meaningfully higher than #2
   if (matches.length === 1 || matches[0].score - (matches[1]?.score || 0) >= 0.25) {
     return { event: matches[0].item };
   }
@@ -693,6 +784,46 @@ function handleTodo(intent, data, session) {
   const items = rec.items || [];
 
   if (intent === 'add_todo') {
+    // ── Batch path: multiple items in one message ──
+    if (Array.isArray(data.items) && data.items.length) {
+      const added = [];
+      for (const entry of data.items) {
+        // Accept either a string or { item } / { text } shape
+        const text = typeof entry === 'string'
+          ? entry.trim()
+          : (entry?.item || entry?.text || '').toString().trim();
+        if (!text) continue;
+        const it = {
+          id: newId(),
+          text,
+          done: false,
+          addedAt: new Date().toISOString(),
+        };
+        items.push(it);
+        added.push(it);
+      }
+
+      if (!added.length) {
+        return `🤔 I didn't catch any items to add.`;
+      }
+
+      set('todo', { items });
+
+      const ids = added.map(a => a.id);
+      session.lastAction = {
+        label: `Added ${added.length} to-dos`,
+        undo: () => {
+          const cur = get('todo').items || [];
+          set('todo', { items: cur.filter(i => !ids.includes(i.id)) });
+          return `Removed ${added.length} to-do${added.length !== 1 ? 's' : ''} (undo).`;
+        }
+      };
+
+      const lines = added.map(a => `• ${a.text}`).join('\n');
+      return `✅ *Added ${added.length} item${added.length !== 1 ? 's' : ''} to to-do:*\n\n${lines}\n\n_Reply *undo* to revert._`;
+    }
+
+    // ── Single-item path ──
     if (!data.item || typeof data.item !== 'string') {
       return `🤔 I didn't catch what to add. Try: _"add call the plumber to to-do"_`;
     }
@@ -743,8 +874,9 @@ function handleTodo(intent, data, session) {
   }
 
   if (intent === 'remove_todo') {
+    const pending = items.filter(i => !i.done);
     const target = typeof data.index === 'number'
-      ? items.filter(i => !i.done)[data.index - 1]
+      ? pending[data.index - 1]
       : (bestMatches(data.item || '', items, t => t.text, 0.5)[0]?.item);
     if (!target) return `❌ Couldn't find that item.`;
 
@@ -819,22 +951,26 @@ function handleShopping(intent, data, session) {
     const added = [];
 
     for (const entry of toAdd) {
-      if (!entry || !entry.item) continue;
+      // Accept either a string or { item, quantity } shape
+      const itemText = typeof entry === 'string' ? entry.trim() : (entry?.item || '').toString().trim();
+      const quantity = typeof entry === 'string' ? null : (entry?.quantity || null);
+      if (!itemText) continue;
+
       const existing = items.find(
-        i => i.item.toLowerCase() === entry.item.toLowerCase() && !i.checked
+        i => i.item.toLowerCase() === itemText.toLowerCase() && !i.checked
       );
       if (existing) {
-        if (entry.quantity) existing.quantity = entry.quantity;
-        added.push({ updated: true, ...entry });
+        if (quantity) existing.quantity = quantity;
+        added.push({ updated: true, item: itemText, quantity });
       } else {
         const it = {
           id: newId(),
-          item: entry.item,
-          quantity: entry.quantity || null,
+          item: itemText,
+          quantity: quantity || null,
           checked: false,
         };
         items.push(it);
-        added.push({ updated: false, ref: it, ...entry });
+        added.push({ updated: false, ref: it, item: itemText, quantity });
       }
     }
 
@@ -951,7 +1087,6 @@ function handleShopping(intent, data, session) {
 // Meal Plan
 // ─────────────────────────────────────────────────────────────────
 function handleMeals(intent, data, session) {
-  // Normalize at the boundary so the LLM's casing doesn't matter
   if (data.mealType) data.mealType = String(data.mealType).toLowerCase().trim();
   if (data.day) {
     const matched = DAYS.find(d => d.toLowerCase() === String(data.day).toLowerCase().trim());
@@ -1138,6 +1273,9 @@ const HELP_TEXT = `🤖 *Family Assistant — Commands:*
 
 📝 *To-Do*
 • "Add fix the fence to to-do"
+• "Add to to-do:
+   - new cushions
+   - new bedsheets"                            ← batch add
 • "Show to-do" / "Mark item 2 done"
 • "Remove item 1" / "Clear completed"
 
@@ -1150,6 +1288,10 @@ const HELP_TEXT = `🤖 *Family Assistant — Commands:*
 🍽️ *Meal Plan*
 • "Add spaghetti for Monday dinner"
 • "Show meal plan" / "Remove Monday lunch"
+
+💬 *Tip:* You can also *reply* to any list message with a command
+like "clear", "remove eggs", or "delete #2" — the bot picks up
+which list you're referring to.
 
 📊 *Other*
 • "Show summary" / "What's on today?"
