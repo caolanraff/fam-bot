@@ -18,6 +18,31 @@ const MEAL_TYPES = ['breakfast', 'lunch', 'dinner'];
 
 const PENDING_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
+// Display timezone — defaults to Hong Kong. Override via env if you move.
+const TZ = process.env.TZ_DISPLAY || 'Asia/Hong_Kong';
+
+// ─────────────────────────────────────────────────────────────────
+// Timezone-safe date helpers
+// ─────────────────────────────────────────────────────────────────
+// "YYYY-MM-DD" for the current moment, in the display timezone (not UTC).
+function todayYMD(now = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: TZ,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(now);
+  const y = parts.find(p => p.type === 'year').value;
+  const m = parts.find(p => p.type === 'month').value;
+  const d = parts.find(p => p.type === 'day').value;
+  return `${y}-${m}-${d}`;
+}
+
+// Weekday name ("Monday", "Friday", ...) for a YYYY-MM-DD string, in TZ.
+function weekdayName(ymd) {
+  return new Date(ymd + 'T12:00:00Z').toLocaleDateString('en-US', {
+    weekday: 'long', timeZone: TZ,
+  });
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Pending-action helpers
 // ─────────────────────────────────────────────────────────────────
@@ -222,12 +247,9 @@ function extractJson(raw) {
   if (typeof raw !== 'string') return raw;
   let s = raw.trim();
 
-  // Strip an outer ```json ... ``` or ``` ... ``` fence if present
   const fence = s.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```\s*$/i);
   if (fence) s = fence[1].trim();
 
-  // Some providers prepend a "json" word or other noise — find the
-  // first { and the last } and take what's between them.
   const first = s.indexOf('{');
   const last  = s.lastIndexOf('}');
   if (first !== -1 && last !== -1 && last > first) {
@@ -240,15 +262,17 @@ function extractJson(raw) {
 // LLM intent parser — session-aware, with safe JSON parsing
 // ─────────────────────────────────────────────────────────────────
 async function parseIntent(userMessage, session, senderName, quotedText = null) {
-  const now = new Date();
+  const todayStr = todayYMD();
+  const dayName  = weekdayName(todayStr);
 
   const events  = (get('calendar').events || []).slice(0, 15);
   const todos   = (get('todo').items     || []).filter(i => !i.done).slice(0, 10);
   const shop    = (get('shopping').items || []).filter(i => !i.checked).slice(0, 15);
 
   const contextSnapshot = {
-    today:    now.toISOString().split('T')[0],
-    weekday:  now.toLocaleDateString('en-US', { weekday: 'long' }),
+    today:    todayStr,
+    weekday:  dayName,
+    timezone: TZ,
     events:   events.map((e, i) => ({ index: i + 1, title: e.title, date: e.date, time: e.time })),
     todos:    todos.map((t, i)  => ({ index: i + 1, text: t.text })),
     shopping: shop.map((s, i)   => ({ index: i + 1, item: s.item, qty: s.quantity })),
@@ -258,7 +282,7 @@ async function parseIntent(userMessage, session, senderName, quotedText = null) 
   const systemPrompt = `You are a friendly family assistant WhatsApp bot for a couple.
 You manage their Calendar, To-Do List, Shopping List, and Meal Plan.
 The person messaging right now is: ${senderName}.
-Today is ${now.toDateString()} (${contextSnapshot.weekday}).
+Today is ${dayName}, ${todayStr} (timezone: ${TZ}).
 
 CURRENT STATE (use this to resolve references like "the staff party", "that one", "item 2"):
 ${JSON.stringify(contextSnapshot, null, 2)}
@@ -423,7 +447,6 @@ Output: { "intent": "clear_shopping", "data": {}, "reply": "" }`;
     return { intent: 'unknown', data: {}, reply: "I'm having trouble reaching my brain right now — try again in a moment?" };
   }
 
-  // Try strict parse first; fall back to fence-stripping if it fails.
   let parsed;
   try {
     parsed = JSON.parse(raw);
@@ -490,7 +513,7 @@ function bestMatches(query, list, getText, threshold = 0.5) {
 
 function isValidYMD(s) {
   if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
-  const d = new Date(s + 'T12:00:00');
+  const d = new Date(s + 'T12:00:00Z');
   return !isNaN(d) && d.toISOString().startsWith(s);
 }
 function isValidHM(s) {
@@ -723,7 +746,7 @@ function handleCalendar(intent, data, session) {
   }
 
   if (intent === 'view_calendar') {
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = todayYMD();
     const upcoming = events.filter(e => e.date >= todayStr);
     session.lastView = { type: 'calendar', items: upcoming.slice(0, 10).map(e => e.title) };
 
@@ -740,8 +763,8 @@ function handleCalendar(intent, data, session) {
 
 function sortEvents(events) {
   events.sort((a, b) =>
-    new Date(`${a.date}T${a.time || '00:00'}`) -
-    new Date(`${b.date}T${b.time || '00:00'}`)
+    new Date(`${a.date}T${a.time || '00:00'}:00Z`) -
+    new Date(`${b.date}T${b.time || '00:00'}:00Z`)
   );
 }
 
@@ -784,11 +807,9 @@ function handleTodo(intent, data, session) {
   const items = rec.items || [];
 
   if (intent === 'add_todo') {
-    // ── Batch path: multiple items in one message ──
     if (Array.isArray(data.items) && data.items.length) {
       const added = [];
       for (const entry of data.items) {
-        // Accept either a string or { item } / { text } shape
         const text = typeof entry === 'string'
           ? entry.trim()
           : (entry?.item || entry?.text || '').toString().trim();
@@ -823,7 +844,6 @@ function handleTodo(intent, data, session) {
       return `✅ *Added ${added.length} item${added.length !== 1 ? 's' : ''} to to-do:*\n\n${lines}\n\n_Reply *undo* to revert._`;
     }
 
-    // ── Single-item path ──
     if (!data.item || typeof data.item !== 'string') {
       return `🤔 I didn't catch what to add. Try: _"add call the plumber to to-do"_`;
     }
@@ -951,7 +971,6 @@ function handleShopping(intent, data, session) {
     const added = [];
 
     for (const entry of toAdd) {
-      // Accept either a string or { item, quantity } shape
       const itemText = typeof entry === 'string' ? entry.trim() : (entry?.item || '').toString().trim();
       const quantity = typeof entry === 'string' ? null : (entry?.quantity || null);
       if (!itemText) continue;
@@ -1184,9 +1203,8 @@ function handleMeals(intent, data, session) {
 // Summary
 // ─────────────────────────────────────────────────────────────────
 function buildSummary() {
-  const now      = new Date();
-  const todayStr = now.toISOString().split('T')[0];
-  const dayName  = now.toLocaleDateString('en-US', { weekday: 'long' });
+  const todayStr = todayYMD();
+  const dayName  = weekdayName(todayStr);
 
   const calRec  = get('calendar');
   const todoRec = get('todo');
@@ -1204,9 +1222,12 @@ function buildSummary() {
     msg += '\n';
   }
 
+  // "Coming up soon" — pure date arithmetic, no TZ surprises.
+  const todayAnchor = new Date(todayStr + 'T12:00:00Z');
   const soon = (calRec.events || []).filter(e => {
-    const diff = (new Date(e.date + 'T12:00:00') - now) / 86400000;
-    return diff > 0 && diff <= 2 && e.date !== todayStr;
+    if (!isValidYMD(e.date) || e.date <= todayStr) return false;
+    const diff = (new Date(e.date + 'T12:00:00Z') - todayAnchor) / 86400000;
+    return diff > 0 && diff <= 2;
   });
   if (soon.length) {
     hasContent = true;
@@ -1255,8 +1276,11 @@ function buildSummary() {
 // ─────────────────────────────────────────────────────────────────
 function fmtDate(dateStr) {
   if (!dateStr) return '';
-  return new Date(dateStr + 'T12:00:00').toLocaleDateString('en-US', {
+  // Anchor at noon UTC so DST transitions can't shift the day,
+  // and pin the formatter to the display timezone.
+  return new Date(dateStr + 'T12:00:00Z').toLocaleDateString('en-US', {
     weekday: 'short', month: 'short', day: 'numeric', year: 'numeric',
+    timeZone: TZ,
   });
 }
 
