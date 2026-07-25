@@ -65,7 +65,14 @@ npm install
 
 ```bash
 npm install -g pm2
-pm2 start src/bot.js --name fam-bot
+pm2 set pm2-logrotate:dateFormat YYYY-MM-DD_HH-mm-ss
+pm2 start src/bot.js --name fam-bot \
+  --node-args="--max-old-space-size=256" \
+  --max-memory-restart 700M \
+  --merge-logs \
+  --log-date-format "YYYY-MM-DD HH:mm:ss" \
+  --output /home/ec2-user/fam-bot.log \
+  --error  /home/ec2-user/fam-bot.log
 pm2 save
 pm2 startup
 ```
@@ -78,7 +85,7 @@ pm2 startup
 - `pm2 delete fam-bot`
 - `pm2 logs fam-bot --lines 100`
 - `pm2 list`
-- `less /home/ec2-user/.pm2/logs/fam-bot-out.log`
+- `less /home/ec2-user/.pm2/logs/fam-bot.log`
 
 ## First run and QR login
 

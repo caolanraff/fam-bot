@@ -302,7 +302,18 @@ Calendar
   update_event  → { match: string OR index: number,
                     changes: { title?, date?, time?, notes? } }
   remove_event  → { match: string OR index: number }
-  view_calendar → {}
+  view_calendar → { from?: "YYYY-MM-DD", to?: "YYYY-MM-DD", label?: string }
+    → If the user asks about a time range ("this week", "today", "tomorrow",
+      "next week", "this weekend", "in March", "next 3 days"), compute the
+      inclusive from/to dates anchored on today, and set "label" to a short
+      human phrase ("this week", "today", "next week", "this weekend", etc.).
+    → "this week" = today through the upcoming Sunday (week ending Sunday).
+    → "next week" = the Monday after this week through the Sunday after that.
+    → "this weekend" = the upcoming Saturday and Sunday (or today+tomorrow
+      if today is already Sat/Sun).
+    → "today" = { from: <today>, to: <today> }.
+    → "tomorrow" = { from: <tomorrow>, to: <tomorrow> }.
+    → If no range is implied ("show calendar", "what's coming up"), return {}.
 
 To-Do
   add_todo
@@ -372,6 +383,14 @@ RULES:
 - OUTPUT FORMAT: Return the JSON object directly. Do NOT wrap it in
   \`\`\`json fences or any other markdown.
 
+CRITICAL OUTPUT RULE:
+Your entire response must be a single JSON object and NOTHING else.
+It must start with the character { and end with the character }.
+Never write a summary, list, greeting, or any prose — even if the user
+asks for one. Even if the CURRENT STATE contains all the data needed to
+answer, you MUST return an intent (like view_todo or summary) and let
+the code format the reply. Data in CURRENT STATE is for reference only.
+
 EXAMPLES:
 
 User: "Add to todo list:
@@ -413,6 +432,15 @@ Output: { "intent": "add_event", "data": { "title": "dentist", "date": "<next-fr
 
 User: "move the staff party to next saturday"
 Output: { "intent": "update_event", "data": { "match": "staff party", "changes": { "date": "<next-saturday>" } }, "reply": "" }
+
+User: "What's on this week"
+Output: { "intent": "view_calendar", "data": { "from": "<today>", "to": "<sunday-of-this-week>", "label": "this week" }, "reply": "" }
+
+User: "anything tomorrow?"
+Output: { "intent": "view_calendar", "data": { "from": "<tomorrow>", "to": "<tomorrow>", "label": "tomorrow" }, "reply": "" }
+
+User: "what's on next week?"
+Output: { "intent": "view_calendar", "data": { "from": "<next-monday>", "to": "<sunday-after-next>", "label": "next week" }, "reply": "" }
 
 User (with reply):
 REPLYING_TO: "🛒 Shopping List: 1. milk  2. bread  3. eggs"
@@ -747,17 +775,52 @@ function handleCalendar(intent, data, session) {
 
   if (intent === 'view_calendar') {
     const todayStr = todayYMD();
-    const upcoming = events.filter(e => e.date >= todayStr);
-    session.lastView = { type: 'calendar', items: upcoming.slice(0, 10).map(e => e.title) };
+    const from  = isValidYMD(data.from) ? data.from : todayStr;
+    const to    = isValidYMD(data.to)   ? data.to   : null;
+    const label = (data.label && typeof data.label === 'string') ? data.label.trim() : '';
 
-    if (!upcoming.length) return `📅 Calendar is clear — no upcoming events!`;
-    const list = upcoming.slice(0, 10).map((e, i) =>
+    const filtered = events.filter(e => e.date >= from && (to ? e.date <= to : true));
+
+    // Cap only when there's no upper bound (open-ended "show calendar")
+    const capped = to ? filtered : filtered.slice(0, 10);
+
+    session.lastView = {
+      type: 'calendar',
+      items: capped.map(e => e.title),
+      from, to, label,
+    };
+
+    // Header reflects what the user actually asked for
+    let header;
+    if (label) {
+      header = `📅 *Events — ${label}:*`;
+    } else if (to && from === to) {
+      header = `📅 *Events on ${fmtDate(from)}:*`;
+    } else if (to) {
+      header = `📅 *Events ${fmtDate(from)} → ${fmtDate(to)}:*`;
+    } else {
+      header = `📅 *Upcoming Events:*`;
+    }
+
+    if (!capped.length) {
+      if (label)             return `📅 Nothing on for *${label}* — you're free!`;
+      if (to && from === to) return `📅 Nothing on ${fmtDate(from)} — you're free!`;
+      if (to)                return `📅 Nothing between ${fmtDate(from)} and ${fmtDate(to)}.`;
+      return `📅 Calendar is clear — no upcoming events!`;
+    }
+
+    const list = capped.map((e, i) =>
       `${i + 1}. *${e.title}*\n` +
       `   📅 ${fmtDate(e.date)}` +
       (e.time  ? ` ⏰ ${e.time}`     : '') +
       (e.notes ? `\n   📝 ${e.notes}` : '')
     ).join('\n\n');
-    return `📅 *Upcoming Events:*\n\n${list}`;
+
+    const more = (!to && filtered.length > capped.length)
+      ? `\n\n_…and ${filtered.length - capped.length} more. Ask for a specific range to narrow down._`
+      : '';
+
+    return `${header}\n\n${list}${more}`;
   }
 }
 
@@ -1294,6 +1357,7 @@ const HELP_TEXT = `🤖 *Family Assistant — Commands:*
 • "Move the staff party to next Saturday"     ← reschedule
 • "Change dentist to 3pm"                     ← edit
 • "Show calendar" / "Remove dentist"
+• "What's on this week?" / "Anything tomorrow?" ← date ranges
 
 📝 *To-Do*
 • "Add fix the fence to to-do"

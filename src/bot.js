@@ -41,9 +41,20 @@ const client = new Client({
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
+      '--disable-gpu',
       '--disable-accelerated-2d-canvas',
       '--no-first-run',
-      '--disable-gpu',
+      '--disable-background-networking',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
+      '--disable-features=TranslateUI,BlinkGenPropertyTrees',
+      '--disable-ipc-flooding-protection',
+      '--disable-default-apps',
+      '--disable-extensions',
+      '--disable-sync',
+      '--metrics-recording-only',
+      '--mute-audio',
     ],
   },
 });
@@ -74,6 +85,12 @@ client.on('authenticated', () => {
 });
 
 client.on('auth_failure', (m) => console.error('❌ Auth failed:', m));
+
+client.on('loading_screen', (percent, message) => {
+  console.log(`[loading] ${percent}% ${message}`);
+});
+
+client.on('change_state', (state) => console.log(`[state] ${state}`));
 
 client.on('ready', () => {
   isReady = true;
