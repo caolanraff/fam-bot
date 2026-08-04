@@ -85,7 +85,7 @@ pm2 startup
 - `pm2 delete fam-bot`
 - `pm2 logs fam-bot --lines 100`
 - `pm2 list`
-- `less /home/ec2-user/.pm2/logs/fam-bot.log`
+- `less /home/ec2-user/fam-bot.log`
 
 ## First run and QR login
 

@@ -287,7 +287,7 @@ Today is ${dayName}, ${todayStr} (timezone: ${TZ}).
 CURRENT STATE (use this to resolve references like "the staff party", "that one", "item 2"):
 ${JSON.stringify(contextSnapshot, null, 2)}
 
-Respond ONLY with valid JSON in this exact shape — NO markdown fences, NO code blocks, NO commentary:
+Respond ONLY with valid JSON in this exact shape. NO markdown fences, NO code blocks, NO commentary, and NO emoji or pictographs anywhere in the output — not in keys, not in values, not in the reply field. ASCII characters only.
 { "intent": string, "data": object, "reply": string }
 
 INTENTS:
@@ -468,6 +468,9 @@ Output: { "intent": "clear_shopping", "data": {}, "reply": "" }`;
       response_format: { type: 'json_object' },
       temperature:     0.2,
       max_tokens:      800,
+      extra_body: {
+        provider: { require_parameters: true },
+      },
     });
     raw = res.choices[0].message.content;
   } catch (err) {
