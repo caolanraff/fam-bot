@@ -21,6 +21,11 @@ const PENDING_TTL_MS = 5 * 60 * 1000; // 5 minutes
 // Display timezone — defaults to Hong Kong. Override via env if you move.
 const TZ = process.env.TZ_DISPLAY || 'Asia/Hong_Kong';
 
+// How many turns of compact classifier trace to send back to the LLM.
+// This is intentionally structured/opaque — never prose — so the model
+// can't pattern-match on prior assistant replies and copy their format.
+const CLASSIFIER_TRACE_TURNS = 8;
+
 // ─────────────────────────────────────────────────────────────────
 // Timezone-safe date helpers
 // ─────────────────────────────────────────────────────────────────
@@ -63,6 +68,26 @@ function looksLikeList(text) {
   if (lines.length < 2) return false;
   const bulletLines = lines.filter(l => /^([-*•]\s|\d+[.)]\s)/.test(l)).length;
   return bulletLines >= 2;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Classifier-trace helpers
+// ─────────────────────────────────────────────────────────────────
+// The classifier trace is a compact, structured record of prior turns
+// used ONLY as input to the LLM intent parser. It never contains the
+// user-facing prose replies, so the model has nothing to copy from.
+function pushTrace(session, userText, executedIntent, extraNote) {
+  if (!Array.isArray(session.classifierTrace)) session.classifierTrace = [];
+  session.classifierTrace.push({ role: 'user', content: userText });
+  const marker = executedIntent
+    ? `[executed:${executedIntent}${extraNote ? ` ${extraNote}` : ''}]`
+    : `[noop${extraNote ? ` ${extraNote}` : ''}]`;
+  session.classifierTrace.push({ role: 'assistant', content: marker });
+  // Keep only the last N entries (user+assistant pairs → 2 per turn)
+  const max = CLASSIFIER_TRACE_TURNS * 2;
+  if (session.classifierTrace.length > max) {
+    session.classifierTrace = session.classifierTrace.slice(-max);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -109,6 +134,9 @@ async function processMessage(client, msg, session) {
   );
 
   let reply;
+  let executedIntent = null; // for classifier trace
+  let traceNote      = null;
+
   try {
     const quick = userText.toLowerCase().trim();
 
@@ -125,9 +153,12 @@ async function processMessage(client, msg, session) {
         const fn = session.pendingAction.pickFromList;
         session.pendingAction = null;
         reply = await fn(n);
+        executedIntent = 'pick_from_list';
+        traceNote = `n=${n}`;
       } else if (/^(no|n|nope|cancel|stop|nvm|never ?mind)\b/.test(quick)) {
         session.pendingAction = null;
         reply = '👍 Cancelled — pick aborted.';
+        executedIntent = 'cancel';
       }
       else {
         session.pendingAction = null;
@@ -138,9 +169,11 @@ async function processMessage(client, msg, session) {
     if (!reply && isPendingLive(session) && session.pendingAction.fn) {
       if (/^(yes|y|yep|yeah|sure|ok|okay|confirm|do it|go ahead)\b/.test(quick)) {
         reply = await executePendingAction(session);
+        executedIntent = 'confirm';
       } else if (/^(no|n|nope|cancel|stop|nvm|never ?mind)\b/.test(quick)) {
         session.pendingAction = null;
         reply = '👍 Cancelled — nothing changed.';
+        executedIntent = 'cancel';
       } else {
         session.pendingAction = null;
       }
@@ -148,6 +181,7 @@ async function processMessage(client, msg, session) {
 
     if (!reply && /^(undo|revert|undo that)\b/i.test(quick)) {
       reply = performUndo(session);
+      executedIntent = 'undo';
     }
 
     if (!reply) {
@@ -168,15 +202,27 @@ async function processMessage(client, msg, session) {
           }
         });
         reply = `🤔 Looks like a list of events. Want me to add them all to the calendar? (*yes* / *no*)`;
+        executedIntent = 'ask_list_kind';
       } else {
         reply = await dispatchIntent(intent, data, session, aiReply);
+        executedIntent = intent;
       }
     }
 
     if (!reply) reply = "Done! ✅";
 
-    session.history.push({ role: 'assistant', content: reply.replace(/\*/g, '') });
-    if (session.history.length > 20) session.history.shift();
+    // ── FIX 3: Store history verbatim — do NOT strip asterisks. ──
+    // (This history is not fed to the classifier anymore; it exists
+    //  in case any other subsystem wants a plain transcript.)
+    if (!Array.isArray(session.history)) session.history = [];
+    session.history.push({ role: 'user',      content: userText });
+    session.history.push({ role: 'assistant', content: reply });
+    if (session.history.length > 40) {
+      session.history = session.history.slice(-40);
+    }
+
+    // ── FIX 1 + 2: Append a compact, structured trace for the classifier. ──
+    pushTrace(session, userText, executedIntent, traceNote);
 
   } catch (err) {
     console.error('[bot] processMessage error:', err);
@@ -260,6 +306,7 @@ function extractJson(raw) {
 
 // ─────────────────────────────────────────────────────────────────
 // LLM intent parser — session-aware, with safe JSON parsing
+// and a one-shot strict retry on non-JSON output.
 // ─────────────────────────────────────────────────────────────────
 async function parseIntent(userMessage, session, senderName, quotedText = null) {
   const todayStr = todayYMD();
@@ -368,6 +415,14 @@ When this happens:
       → { "intent": "update_event", "data": { "match": "<title from REPLYING_TO>", "changes": { ... } } }
 - If USER_MESSAGE alone is enough (e.g. "show calendar"), ignore REPLYING_TO.
 
+TRACE-CONTEXT HANDLING:
+Prior turns in this conversation are shown as compact markers like
+"[executed:add_todo]" or "[executed:view_calendar]". These are the ONLY
+form prior assistant turns will take. They are opaque — never copy their
+text, never treat them as templates for your output. Use them only to
+resolve pronouns (e.g. after "[executed:view_todo]" the user saying
+"remove #2" refers to that list).
+
 RULES:
 - Convert relative dates ("tomorrow", "next Friday", "in 3 days", "Tuesday 2nd")
   to YYYY-MM-DD using today's date as the anchor. Always pick the NEAREST
@@ -386,10 +441,13 @@ RULES:
 CRITICAL OUTPUT RULE:
 Your entire response must be a single JSON object and NOTHING else.
 It must start with the character { and end with the character }.
-Never write a summary, list, greeting, or any prose — even if the user
-asks for one. Even if the CURRENT STATE contains all the data needed to
-answer, you MUST return an intent (like view_todo or summary) and let
-the code format the reply. Data in CURRENT STATE is for reference only.
+Never write a summary, list, greeting, confirmation, or any prose —
+even if the user asks for one, and even if prior assistant turns look
+like natural language. Even if the CURRENT STATE contains all the data
+needed to answer, you MUST return an intent (like view_todo or summary)
+and let the code format the reply. Data in CURRENT STATE is for
+reference only. Never emit strings like "Added to to-do list" or
+"Reply undo to revert" — those are produced by the calling code.
 
 EXAMPLES:
 
@@ -451,15 +509,23 @@ Output: { "intent": "clear_shopping", "data": {}, "reply": "" }`;
     ? `REPLYING_TO:\n"""\n${quotedText}\n"""\n\nUSER_MESSAGE:\n${userMessage}`
     : userMessage;
 
+  // ── FIX 1 + 2: Feed the classifier trace (compact, opaque markers),
+  // NOT the prose conversational history. This prevents the model from
+  // copying our own formatted replies back at us.
+  const trace = Array.isArray(session.classifierTrace)
+    ? session.classifierTrace.slice(-CLASSIFIER_TRACE_TURNS * 2)
+    : [];
+
   const messages = [
     { role: 'system', content: systemPrompt },
-    ...session.history.slice(-8).map(h => ({
+    ...trace.map(h => ({
       role: h.role === 'assistant' ? 'assistant' : 'user',
-      content: typeof h.content === 'string' ? h.content : (h.body || '')
+      content: typeof h.content === 'string' ? h.content : '',
     })),
     { role: 'user', content: userTurnContent },
   ];
 
+  // ── First attempt ────────────────────────────────────────────
   let raw;
   try {
     const res = await openai.chat.completions.create({
@@ -478,34 +544,77 @@ Output: { "intent": "clear_shopping", "data": {}, "reply": "" }`;
     return { intent: 'unknown', data: {}, reply: "I'm having trouble reaching my brain right now — try again in a moment?" };
   }
 
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
+  let parsed = tryParseJson(raw);
+
+  // ── FIX 4: One strict retry if the model returned prose ──
+  if (!parsed) {
+    console.warn('[bot] LLM returned non-JSON on first try — retrying strictly. raw:', raw);
     try {
-      parsed = JSON.parse(extractJson(raw));
-      console.log('[bot] recovered JSON after stripping wrapper');
-    } catch (e2) {
-      console.error('[bot] LLM returned non-JSON:', raw);
-      return { intent: 'unknown', data: {}, reply: "Sorry, I got confused — could you rephrase?" };
+      const retryMessages = [
+        ...messages,
+        { role: 'assistant', content: raw },
+        {
+          role: 'user',
+          content:
+            'That reply was invalid. Respond again with ONE JSON object only — ' +
+            'starting with { and ending with } — and nothing else. ' +
+            'No prose, no confirmation text, no markdown, no emoji. ' +
+            'Just the JSON object matching the schema.',
+        },
+      ];
+      const retryRes = await openai.chat.completions.create({
+        model:           process.env.OPENAI_MODEL,
+        messages:        retryMessages,
+        response_format: { type: 'json_object' },
+        temperature:     0,
+        max_tokens:      800,
+        extra_body: {
+          provider: { require_parameters: true },
+        },
+      });
+      const retryRaw = retryRes.choices[0].message.content;
+      parsed = tryParseJson(retryRaw);
+      if (parsed) {
+        console.log('[bot] recovered JSON on strict retry');
+      } else {
+        console.error('[bot] LLM returned non-JSON twice. retryRaw:', retryRaw);
+      }
+    } catch (err) {
+      console.error('[bot] strict retry failed:', err.message);
     }
   }
 
+  if (!parsed) {
+    return { intent: 'unknown', data: {}, reply: "Sorry, I got confused — could you rephrase?" };
+  }
+
   try {
-    if (!parsed || typeof parsed !== 'object' || typeof parsed.intent !== 'string') {
+    if (typeof parsed !== 'object' || typeof parsed.intent !== 'string') {
       throw new Error('parsed JSON missing intent');
     }
     parsed.data  = parsed.data  || {};
     parsed.reply = parsed.reply || '';
 
     if (parsed.intent === 'unknown') {
-      console.log('[bot] LLM returned unknown. raw:', raw);
+      console.log('[bot] LLM returned unknown.');
     }
     return parsed;
   } catch (e) {
-    console.error('[bot] LLM JSON missing required fields:', raw);
+    console.error('[bot] LLM JSON missing required fields:', parsed);
     return { intent: 'unknown', data: {}, reply: "Sorry, I got confused — could you rephrase?" };
   }
+}
+
+// Helper: try strict parse, then fenced/embedded parse, return null on failure.
+function tryParseJson(raw) {
+  if (typeof raw !== 'string') return null;
+  try {
+    return JSON.parse(raw);
+  } catch {}
+  try {
+    return JSON.parse(extractJson(raw));
+  } catch {}
+  return null;
 }
 
 // ─────────────────────────────────────────────────────────────────
