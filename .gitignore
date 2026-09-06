@@ -3,3 +3,4 @@ build/
 qr-data.txt
 .env
 .DS_Store
+.claude

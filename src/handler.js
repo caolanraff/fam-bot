@@ -22,14 +22,11 @@ const PENDING_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const TZ = process.env.TZ_DISPLAY || 'Asia/Hong_Kong';
 
 // How many turns of compact classifier trace to send back to the LLM.
-// This is intentionally structured/opaque — never prose — so the model
-// can't pattern-match on prior assistant replies and copy their format.
 const CLASSIFIER_TRACE_TURNS = 8;
 
 // ─────────────────────────────────────────────────────────────────
 // Timezone-safe date helpers
 // ─────────────────────────────────────────────────────────────────
-// "YYYY-MM-DD" for the current moment, in the display timezone (not UTC).
 function todayYMD(now = new Date()) {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: TZ,
@@ -41,7 +38,6 @@ function todayYMD(now = new Date()) {
   return `${y}-${m}-${d}`;
 }
 
-// Weekday name ("Monday", "Friday", ...) for a YYYY-MM-DD string, in TZ.
 function weekdayName(ymd) {
   return new Date(ymd + 'T12:00:00Z').toLocaleDateString('en-US', {
     weekday: 'long', timeZone: TZ,
@@ -61,7 +57,6 @@ function setPending(session, action) {
   session.pendingAction = { ...action, expiresAt: Date.now() + PENDING_TTL_MS };
 }
 
-// Detect bullet/numbered list shape — used as a fallback when intent=unknown
 function looksLikeList(text) {
   if (!text) return false;
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
@@ -71,11 +66,37 @@ function looksLikeList(text) {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Pick-list parser: "1", "1,2,3", "1.2.3", "1 2 3", "1-3", "1,3-5", "#1 #2"
+// Returns a sorted unique array of numbers, or null if not a pick.
+// Accepts commas, dots, semicolons and whitespace as separators.
+// ─────────────────────────────────────────────────────────────────
+function parsePickList(text) {
+  if (!text) return null;
+  const cleaned = text
+    .trim()
+    .replace(/#/g, '')
+    .replace(/[,\.\s;]+/g, ',')
+    .replace(/^,|,$/g, '');
+  if (!cleaned) return null;
+  if (!/^\d+(-\d+)?(,\d+(-\d+)?)*$/.test(cleaned)) return null;
+  const nums = new Set();
+  for (const part of cleaned.split(',')) {
+    if (part.includes('-')) {
+      const [a, b] = part.split('-').map(Number);
+      if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+      const lo = Math.min(a, b), hi = Math.max(a, b);
+      if (hi - lo > 50) return null; // guard against silly ranges
+      for (let i = lo; i <= hi; i++) nums.add(i);
+    } else {
+      nums.add(Number(part));
+    }
+  }
+  return nums.size ? [...nums].sort((a, b) => a - b) : null;
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Classifier-trace helpers
 // ─────────────────────────────────────────────────────────────────
-// The classifier trace is a compact, structured record of prior turns
-// used ONLY as input to the LLM intent parser. It never contains the
-// user-facing prose replies, so the model has nothing to copy from.
 function pushTrace(session, userText, executedIntent, extraNote) {
   if (!Array.isArray(session.classifierTrace)) session.classifierTrace = [];
   session.classifierTrace.push({ role: 'user', content: userText });
@@ -83,7 +104,6 @@ function pushTrace(session, userText, executedIntent, extraNote) {
     ? `[executed:${executedIntent}${extraNote ? ` ${extraNote}` : ''}]`
     : `[noop${extraNote ? ` ${extraNote}` : ''}]`;
   session.classifierTrace.push({ role: 'assistant', content: marker });
-  // Keep only the last N entries (user+assistant pairs → 2 per turn)
   const max = CLASSIFIER_TRACE_TURNS * 2;
   if (session.classifierTrace.length > max) {
     session.classifierTrace = session.classifierTrace.slice(-max);
@@ -108,7 +128,6 @@ async function processMessage(client, msg, session) {
   const userText = msg.body?.trim();
   if (!userText) return;
 
-  // ── Pull quoted-message text if the user used WhatsApp's reply feature ──
   let quotedText = null;
   if (msg.hasQuotedMsg) {
     try {
@@ -134,46 +153,63 @@ async function processMessage(client, msg, session) {
   );
 
   let reply;
-  let executedIntent = null; // for classifier trace
+  let executedIntent = null;
   let traceNote      = null;
 
   try {
     const quick = userText.toLowerCase().trim();
 
-    // Expire stale pending actions silently
     if (session.pendingAction && !isPendingLive(session)) {
       session.pendingAction = null;
     }
 
-    // ── Fast path 1: numeric reply to a disambiguation prompt ──
+    // ── Fast path 1: numeric reply(s) to a disambiguation / bulk-pick prompt ──
     if (isPendingLive(session) && session.pendingAction.pickFromList) {
-      const m = quick.match(/^#?(\d+)$/);
-      if (m) {
-        const n  = parseInt(m[1], 10);
-        const fn = session.pendingAction.pickFromList;
-        session.pendingAction = null;
-        reply = await fn(n);
-        executedIntent = 'pick_from_list';
-        traceNote = `n=${n}`;
+      const indices = parsePickList(quick);
+      if (indices && indices.length) {
+        const fn         = session.pendingAction.pickFromList;
+        const allowMulti = !!session.pendingAction.multi;
+        if (!allowMulti && indices.length > 1) {
+          reply = `🤔 Please pick just one number, or say *cancel*.`;
+          executedIntent = 'pick_from_list';
+          traceNote = `rejected_multi n=${indices.join(',')}`;
+          console.log(`[bot] intent=pick_from_list rejected-multi n=${indices.join(',')} (fast-path)`);
+        } else {
+          session.pendingAction = null;
+          reply = await fn(allowMulti ? indices : indices[0]);
+          executedIntent = 'pick_from_list';
+          traceNote = `n=${indices.join(',')}`;
+          console.log(`[bot] intent=pick_from_list n=${indices.join(',')} (fast-path)`);
+        }
       } else if (/^(no|n|nope|cancel|stop|nvm|never ?mind)\b/.test(quick)) {
         session.pendingAction = null;
         reply = '👍 Cancelled — pick aborted.';
         executedIntent = 'cancel';
+        console.log('[bot] intent=cancel (fast-path)');
       }
-      else {
-        session.pendingAction = null;
-      }
+      // else: fall through — Fast Path 2 may still handle "yes"/"all"
+      // for pending actions that also expose an fn (e.g. calendar bulk-remove).
     }
 
     // ── Fast path 2: yes / no while a confirmation is pending ──
     if (!reply && isPendingLive(session) && session.pendingAction.fn) {
-      if (/^(yes|y|yep|yeah|sure|ok|okay|confirm|do it|go ahead)\b/.test(quick)) {
+      if (/^(yes|y|yep|yeah|sure|ok|okay|confirm|do it|go ahead|all)\b/.test(quick)) {
         reply = await executePendingAction(session);
         executedIntent = 'confirm';
+        console.log('[bot] intent=confirm (fast-path)');
       } else if (/^(no|n|nope|cancel|stop|nvm|never ?mind)\b/.test(quick)) {
         session.pendingAction = null;
         reply = '👍 Cancelled — nothing changed.';
         executedIntent = 'cancel';
+        console.log('[bot] intent=cancel (fast-path)');
+      } else if (!session.pendingAction.pickFromList && parsePickList(quick)) {
+        // Pure fn-only confirmation (clear_shopping, clear_completed, etc.):
+        // a bare pick-list like "1-4" or "1,2,3" is treated as "yes, do it".
+        // Actions with pickFromList already got their shot in Fast Path 1.
+        console.log('[bot] intent=confirm via-picklist (fast-path)');
+        reply = await executePendingAction(session);
+        executedIntent = 'confirm';
+        traceNote = 'via-picklist';
       } else {
         session.pendingAction = null;
       }
@@ -182,6 +218,7 @@ async function processMessage(client, msg, session) {
     if (!reply && /^(undo|revert|undo that)\b/i.test(quick)) {
       reply = performUndo(session);
       executedIntent = 'undo';
+      console.log('[bot] intent=undo (fast-path)');
     }
 
     if (!reply) {
@@ -189,7 +226,6 @@ async function processMessage(client, msg, session) {
       const { intent, data, reply: aiReply } = parsed;
       console.log(`[bot] intent=${intent}`, JSON.stringify(data));
 
-      // ── Bare-list fallback ──
       if (intent === 'unknown' && !quotedText && looksLikeList(userText)) {
         const original = userText;
         setPending(session, {
@@ -211,9 +247,6 @@ async function processMessage(client, msg, session) {
 
     if (!reply) reply = "Done! ✅";
 
-    // ── FIX 3: Store history verbatim — do NOT strip asterisks. ──
-    // (This history is not fed to the classifier anymore; it exists
-    //  in case any other subsystem wants a plain transcript.)
     if (!Array.isArray(session.history)) session.history = [];
     session.history.push({ role: 'user',      content: userText });
     session.history.push({ role: 'assistant', content: reply });
@@ -221,7 +254,6 @@ async function processMessage(client, msg, session) {
       session.history = session.history.slice(-40);
     }
 
-    // ── FIX 1 + 2: Append a compact, structured trace for the classifier. ──
     pushTrace(session, userText, executedIntent, traceNote);
 
   } catch (err) {
@@ -285,9 +317,7 @@ async function dispatchIntent(intent, data, session, aiReply) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Robust JSON extraction — strips ```json ... ``` fences and any
-// stray prose around the JSON object so JSON.parse can't trip on
-// them.
+// Robust JSON extraction
 // ─────────────────────────────────────────────────────────────────
 function extractJson(raw) {
   if (typeof raw !== 'string') return raw;
@@ -305,8 +335,7 @@ function extractJson(raw) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// LLM intent parser — session-aware, with safe JSON parsing
-// and a one-shot strict retry on non-JSON output.
+// LLM intent parser
 // ─────────────────────────────────────────────────────────────────
 async function parseIntent(userMessage, session, senderName, quotedText = null) {
   const todayStr = todayYMD();
@@ -348,7 +377,19 @@ Calendar
       should be treated as add_event BATCH.
   update_event  → { match: string OR index: number,
                     changes: { title?, date?, time?, notes? } }
-  remove_event  → { match: string OR index: number }
+  remove_event  → { match: string OR index: number,
+                    scope?: "one" | "past" | "future" | "all" }
+    → scope defaults to "one" (a single event; may prompt for disambiguation).
+    → "all" removes EVERY event matching the title, past and future.
+    → "past" removes matching events with date before today.
+    → "future" removes matching events with date today or later.
+    → Users express bulk removal with phrases like:
+        "remove all X", "clear all X", "delete every X",
+        "remove all past X", "remove all future X",
+        "remove all past and future X", "remove all past and present X",
+        "remove all upcoming X", "wipe out X".
+      All of these are bulk scopes — NEVER treat them as single removes.
+    → "past and future" and "past and present" both map to scope: "all".
   view_calendar → { from?: "YYYY-MM-DD", to?: "YYYY-MM-DD", label?: string }
     → If the user asks about a time range ("this week", "today", "tomorrow",
       "next week", "this weekend", "in March", "next 3 days"), compute the
@@ -368,8 +409,11 @@ To-Do
     BATCH:  { items: [ { item: string }, ... ]  OR  [ string, ... ] }
     → Use BATCH whenever the user gives more than one to-do in one message
       (bullet list, numbered list, "and", multiple lines, etc.).
-  complete_todo   → { index: number } OR { item: string }
-  remove_todo     → { index: number } OR { item: string }
+  complete_todo   → { index: number } OR { indices: [number, ...] } OR { item: string }
+  remove_todo     → { index: number } OR { indices: [number, ...] } OR { item: string }
+    → Use "indices" whenever the user picks multiple items by number
+      ("remove 1, 3, 4", "mark 2 and 4 done", "delete #1 and #3", "1-4").
+      Indices refer to the numbered list the user last saw.
   clear_completed → {}
   view_todo       → {}
 
@@ -377,8 +421,11 @@ Shopping
   add_shopping
     SINGLE: { item, quantity? }
     BATCH:  { items: [ { item, quantity? }, ... ] }
-  remove_shopping → { index: number } OR { item: string }
-  check_shopping  → { index: number } OR { item: string }
+  remove_shopping → { index: number } OR { indices: [number, ...] } OR { item: string }
+  check_shopping  → { index: number } OR { indices: [number, ...] } OR { item: string }
+    → Use "indices" whenever the user picks multiple items by number
+      ("remove 1, 3, 4", "check off 2 and 4", "1-3").
+      Indices refer to the numbered list the user last saw.
   clear_shopping  → {}
   view_shopping   → {}
 
@@ -491,6 +538,21 @@ Output: { "intent": "add_event", "data": { "title": "dentist", "date": "<next-fr
 User: "move the staff party to next saturday"
 Output: { "intent": "update_event", "data": { "match": "staff party", "changes": { "date": "<next-saturday>" } }, "reply": "" }
 
+User: "remove dentist"
+Output: { "intent": "remove_event", "data": { "match": "dentist", "scope": "one" }, "reply": "" }
+
+User: "Remove all past and future from Calendar - Cut Josie's Nails"
+Output: { "intent": "remove_event", "data": { "match": "Cut Josie's Nails", "scope": "all" }, "reply": "" }
+
+User: "delete every dentist appointment"
+Output: { "intent": "remove_event", "data": { "match": "dentist", "scope": "all" }, "reply": "" }
+
+User: "clear all past piano lessons"
+Output: { "intent": "remove_event", "data": { "match": "piano lessons", "scope": "past" }, "reply": "" }
+
+User: "remove all upcoming yoga"
+Output: { "intent": "remove_event", "data": { "match": "yoga", "scope": "future" }, "reply": "" }
+
 User: "What's on this week"
 Output: { "intent": "view_calendar", "data": { "from": "<today>", "to": "<sunday-of-this-week>", "label": "this week" }, "reply": "" }
 
@@ -503,15 +565,23 @@ Output: { "intent": "view_calendar", "data": { "from": "<next-monday>", "to": "<
 User (with reply):
 REPLYING_TO: "🛒 Shopping List: 1. milk  2. bread  3. eggs"
 USER_MESSAGE: "clear"
-Output: { "intent": "clear_shopping", "data": {}, "reply": "" }`;
+Output: { "intent": "clear_shopping", "data": {}, "reply": "" }
+
+User (with reply):
+REPLYING_TO: "🛒 Shopping List: 1. milk  2. bread  3. eggs  4. cheese"
+USER_MESSAGE: "remove 1, 3, 4"
+Output: { "intent": "remove_shopping", "data": { "indices": [1, 3, 4] }, "reply": "" }
+
+User: "mark 2 and 4 done"
+Output: { "intent": "complete_todo", "data": { "indices": [2, 4] }, "reply": "" }
+
+User: "check off 1 and 3 from shopping"
+Output: { "intent": "check_shopping", "data": { "indices": [1, 3] }, "reply": "" }`;
 
   const userTurnContent = quotedText
     ? `REPLYING_TO:\n"""\n${quotedText}\n"""\n\nUSER_MESSAGE:\n${userMessage}`
     : userMessage;
 
-  // ── FIX 1 + 2: Feed the classifier trace (compact, opaque markers),
-  // NOT the prose conversational history. This prevents the model from
-  // copying our own formatted replies back at us.
   const trace = Array.isArray(session.classifierTrace)
     ? session.classifierTrace.slice(-CLASSIFIER_TRACE_TURNS * 2)
     : [];
@@ -525,7 +595,6 @@ Output: { "intent": "clear_shopping", "data": {}, "reply": "" }`;
     { role: 'user', content: userTurnContent },
   ];
 
-  // ── First attempt ────────────────────────────────────────────
   let raw;
   try {
     const res = await openai.chat.completions.create({
@@ -546,7 +615,6 @@ Output: { "intent": "clear_shopping", "data": {}, "reply": "" }`;
 
   let parsed = tryParseJson(raw);
 
-  // ── FIX 4: One strict retry if the model returned prose ──
   if (!parsed) {
     console.warn('[bot] LLM returned non-JSON on first try — retrying strictly. raw:', raw);
     try {
@@ -605,15 +673,10 @@ Output: { "intent": "clear_shopping", "data": {}, "reply": "" }`;
   }
 }
 
-// Helper: try strict parse, then fenced/embedded parse, return null on failure.
 function tryParseJson(raw) {
   if (typeof raw !== 'string') return null;
-  try {
-    return JSON.parse(raw);
-  } catch {}
-  try {
-    return JSON.parse(extractJson(raw));
-  } catch {}
+  try { return JSON.parse(raw); } catch {}
+  try { return JSON.parse(extractJson(raw)); } catch {}
   return null;
 }
 
@@ -629,7 +692,7 @@ async function executePendingAction(session) {
 
 function performUndo(session) {
   if (!session.lastAction || !session.lastAction.undo) {
-    return "Nothing to undo right now.";
+    return "🤔 Nothing to undo right now.";
   }
   const result = session.lastAction.undo();
   session.lastAction = null;
@@ -673,6 +736,17 @@ function normalizeHM(s) {
 
 function newId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+// Normalise an incoming indices array — dedupe, sort, drop non-numbers.
+function normaliseIndices(input) {
+  if (!Array.isArray(input)) return [];
+  const nums = new Set();
+  for (const v of input) {
+    const n = typeof v === 'number' ? v : Number(v);
+    if (Number.isFinite(n) && n >= 1) nums.add(Math.floor(n));
+  }
+  return [...nums].sort((a, b) => a - b);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -786,6 +860,7 @@ function handleCalendar(intent, data, session) {
       const candidates = found.candidates;
       const pendingChanges = data.changes || {};
       setPending(session, {
+        // update takes a single event only → single-index callback
         pickFromList: (n) => {
           const ev = candidates[n - 1];
           if (!ev) return `❌ ${n} isn't on the list — try again or say *cancel*.`;
@@ -849,21 +924,146 @@ function handleCalendar(intent, data, session) {
   }
 
   if (intent === 'remove_event') {
+    const scope = (typeof data.scope === 'string' ? data.scope.toLowerCase() : 'one');
+
+    // ── Scoped bulk removal ──────────────────────────────────────
+    if (scope === 'past' || scope === 'future' || scope === 'all') {
+      const query = (data.match || data.title || '').toString().trim();
+      if (!query) {
+        return `Which events? Try: _"remove all dentist appointments"_.`;
+      }
+      if (!events.length) {
+        return `📅 Calendar is empty — nothing to remove.`;
+      }
+
+      const matches = bestMatches(query, events, e => e.title, 0.5).map(m => m.item);
+      if (!matches.length) {
+        return `❌ Couldn't find any events matching "${query}".`;
+      }
+
+      const todayStr = todayYMD();
+      let targets;
+      if (scope === 'past')        targets = matches.filter(e => e.date <  todayStr);
+      else if (scope === 'future') targets = matches.filter(e => e.date >= todayStr);
+      else                         targets = matches.slice();
+
+      if (!targets.length) {
+        const label = scope === 'past' ? 'past' : (scope === 'future' ? 'upcoming' : 'matching');
+        return `❌ No ${label} events matching "${query}".`;
+      }
+
+      const scopeLabel = scope === 'all' ? '' :
+                         scope === 'past' ? 'past ' :
+                         'upcoming ';
+      const snapshot = targets.slice();
+
+      // Shared removal helper — used by both "yes" (all) and pick-list (subset).
+      const removeThese = (toRemove) => {
+        const freshEvents = get('calendar').events || [];
+        const ids = new Set(toRemove.map(e => e.id));
+        const kept = freshEvents.filter(e => !ids.has(e.id));
+        set('calendar', { events: kept });
+
+        const removedSnap = toRemove.slice();
+        session.lastAction = {
+          label: `Removed ${removedSnap.length} events`,
+          undo: () => {
+            const cur = get('calendar').events || [];
+            cur.push(...removedSnap);
+            sortEvents(cur);
+            set('calendar', { events: cur });
+            return `Restored ${removedSnap.length} event${removedSnap.length !== 1 ? 's' : ''}.`;
+          }
+        };
+
+        if (removedSnap.length === 1) {
+          const ev = removedSnap[0];
+          return `🗑️ Removed *${ev.title}* (${fmtDate(ev.date)}${ev.time ? ' ' + ev.time : ''}).\n\n_Reply *undo* to restore._`;
+        }
+        const lines = removedSnap.map(e =>
+          `• *${e.title}* — ${fmtDate(e.date)}${e.time ? ' ' + e.time : ''}`
+        ).join('\n');
+        return `🗑️ Removed *${removedSnap.length}* event${removedSnap.length !== 1 ? 's' : ''} matching "${query}":\n${lines}\n\n_Reply *undo* to restore._`;
+      };
+
+      setPending(session, {
+        multi: true,
+        // "yes" / "all" → remove everything in the snapshot
+        fn: () => removeThese(snapshot),
+        // "1", "1,3", "1-4" → remove only those from the snapshot
+        pickFromList: (input) => {
+          const nums = Array.isArray(input) ? input : [input];
+          const picked = nums
+            .map(n => snapshot[n - 1])
+            .filter(Boolean);
+          if (!picked.length) {
+            return `❌ None of those numbers match — try again or say *cancel*.`;
+          }
+          return removeThese(picked);
+        }
+      });
+
+      // Numbered preview so the user can refer to items by number.
+      const preview = snapshot.slice(0, 10).map((e, i) =>
+        `${i + 1}. *${e.title}* — ${fmtDate(e.date)}${e.time ? ' ' + e.time : ''}`
+      ).join('\n');
+      const more = snapshot.length > 10
+        ? `\n_…and ${snapshot.length - 10} more (not individually selectable — use *yes* to remove all)._`
+        : '';
+
+      return (
+        `🗑️ About to remove *${snapshot.length}* ${scopeLabel}event${snapshot.length !== 1 ? 's' : ''} matching "${query}":\n\n` +
+        `${preview}${more}\n\n` +
+        `Reply *yes* to remove all, pick some (e.g. "1,3" or "1-4"), or *no* to cancel.`
+      );
+    }
+
+    // ── Single removal (existing behaviour) ──────────────────────
     const found = resolveEvent(events, data);
     if (found.error) return found.error;
     if (found.ambiguous) {
       const candidates = found.candidates;
       setPending(session, {
-        pickFromList: (n) => {
-          const ev = candidates[n - 1];
-          if (!ev) return `❌ ${n} isn't on the list — try again or say *cancel*.`;
+        multi: true, // allow "1,2,3" or "1-3" to remove several at once
+        pickFromList: (input) => {
+          const nums = Array.isArray(input) ? input : [input];
+          const picked = nums
+            .map(n => candidates[n - 1])
+            .filter(Boolean);
+
+          if (!picked.length) {
+            return `❌ None of those numbers match — try again or say *cancel*.`;
+          }
+
           const freshEvents = get('calendar').events || [];
-          const idx = freshEvents.findIndex(e => e.id === ev.id);
-          if (idx === -1) return `❌ That event seems to be gone now.`;
-          return handleCalendar('remove_event', { index: idx + 1 }, session);
+          const ids = new Set(picked.map(e => e.id));
+          const kept = freshEvents.filter(e => !ids.has(e.id));
+          set('calendar', { events: kept });
+
+          const snapshot = picked.slice();
+          session.lastAction = {
+            label: `Removed ${snapshot.length} event(s)`,
+            undo: () => {
+              const cur = get('calendar').events || [];
+              cur.push(...snapshot);
+              sortEvents(cur);
+              set('calendar', { events: cur });
+              return `Restored ${snapshot.length} event${snapshot.length !== 1 ? 's' : ''}.`;
+            }
+          };
+
+          if (snapshot.length === 1) {
+            const ev = snapshot[0];
+            return `🗑️ Removed *${ev.title}* (${fmtDate(ev.date)}${ev.time ? ' ' + ev.time : ''}).\n\n_Reply *undo* to restore._`;
+          }
+          const lines = snapshot.map(e =>
+            `• *${e.title}* — ${fmtDate(e.date)}${e.time ? ' ' + e.time : ''}`
+          ).join('\n');
+          return `🗑️ Removed *${snapshot.length}* events:\n${lines}\n\n_Reply *undo* to restore._`;
         }
       });
-      return found.ambiguous;
+      // Tweak the ambiguity prompt to hint that multi-pick is allowed
+      return found.ambiguous + `\n_Tip: you can pick several, e.g. "1,3" or "1-4"._`;
     }
 
     const ev = found.event;
@@ -892,8 +1092,6 @@ function handleCalendar(intent, data, session) {
     const label = (data.label && typeof data.label === 'string') ? data.label.trim() : '';
 
     const filtered = events.filter(e => e.date >= from && (to ? e.date <= to : true));
-
-    // Cap only when there's no upper bound (open-ended "show calendar")
     const capped = to ? filtered : filtered.slice(0, 10);
 
     session.lastView = {
@@ -902,7 +1100,6 @@ function handleCalendar(intent, data, session) {
       from, to, label,
     };
 
-    // Header reflects what the user actually asked for
     let header;
     if (label) {
       header = `📅 *Events — ${label}:*`;
@@ -1045,6 +1242,33 @@ function handleTodo(intent, data, session) {
 
   if (intent === 'complete_todo') {
     const pending = items.filter(i => !i.done);
+
+    // ── Multi-index complete: { indices: [1,3,4] } ──
+    const indices = normaliseIndices(data.indices);
+    if (indices.length) {
+      const picked = indices.map(n => pending[n - 1]).filter(Boolean);
+      if (!picked.length) return `❌ None of those numbers match your to-do list.`;
+
+      const stamp = new Date().toISOString();
+      picked.forEach(t => { t.done = true; t.completedAt = stamp; });
+      set('todo', { items });
+
+      const ids = picked.map(p => p.id);
+      session.lastAction = {
+        label: `Completed ${picked.length} to-dos`,
+        undo: () => {
+          const cur = get('todo').items || [];
+          cur.forEach(i => {
+            if (ids.includes(i.id)) { i.done = false; delete i.completedAt; }
+          });
+          set('todo', { items: cur });
+          return `Unmarked ${picked.length} to-do${picked.length !== 1 ? 's' : ''}.`;
+        }
+      };
+      const lines = picked.map(t => `✅ ${t.text}`).join('\n');
+      return `🎉 *Marked ${picked.length} as done:*\n${lines}\n\n_Reply *undo* to unmark._`;
+    }
+
     const target  = typeof data.index === 'number'
       ? pending[data.index - 1]
       : (bestMatches(data.item || '', pending, t => t.text, 0.5)[0]?.item);
@@ -1070,6 +1294,30 @@ function handleTodo(intent, data, session) {
 
   if (intent === 'remove_todo') {
     const pending = items.filter(i => !i.done);
+
+    // ── Multi-index removal: { indices: [1,3,4] } ──
+    const indices = normaliseIndices(data.indices);
+    if (indices.length) {
+      const picked = indices.map(n => pending[n - 1]).filter(Boolean);
+      if (!picked.length) return `❌ None of those numbers match your to-do list.`;
+
+      const ids = new Set(picked.map(p => p.id));
+      const snapshot = picked.slice();
+      const kept = items.filter(i => !ids.has(i.id));
+      set('todo', { items: kept });
+
+      session.lastAction = {
+        label: `Removed ${snapshot.length} to-dos`,
+        undo: () => {
+          const cur = get('todo').items || [];
+          set('todo', { items: cur.concat(snapshot) });
+          return `Restored ${snapshot.length} to-do${snapshot.length !== 1 ? 's' : ''}.`;
+        }
+      };
+      const lines = snapshot.map(t => `• ${t.text}`).join('\n');
+      return `🗑️ *Removed ${snapshot.length} to-do${snapshot.length !== 1 ? 's' : ''}:*\n${lines}\n\n_Reply *undo* to restore._`;
+    }
+
     const target = typeof data.index === 'number'
       ? pending[data.index - 1]
       : (bestMatches(data.item || '', items, t => t.text, 0.5)[0]?.item);
@@ -1197,6 +1445,33 @@ function handleShopping(intent, data, session) {
 
   if (intent === 'check_shopping') {
     const unchecked = items.filter(i => !i.checked);
+
+    // ── Multi-index toggle: { indices: [1,3,4] } ──
+    const indices = normaliseIndices(data.indices);
+    if (indices.length) {
+      const picked = indices.map(n => unchecked[n - 1]).filter(Boolean);
+      if (!picked.length) return `❌ None of those numbers match anything on the list.`;
+
+      const prevStates = picked.map(t => ({ id: t.id, prev: t.checked }));
+      picked.forEach(t => { t.checked = !t.checked; });
+      set('shopping', { items });
+
+      session.lastAction = {
+        label: `Toggled ${picked.length} shopping item(s)`,
+        undo: () => {
+          const cur = get('shopping').items || [];
+          for (const { id, prev } of prevStates) {
+            const t = cur.find(i => i.id === id);
+            if (t) t.checked = prev;
+          }
+          set('shopping', { items: cur });
+          return `Reverted ${picked.length} shopping item${picked.length !== 1 ? 's' : ''}.`;
+        }
+      };
+      const lines = picked.map(t => `${t.checked ? '✅' : '🔲'} ${t.item}`).join('\n');
+      return `🛒 *Updated ${picked.length} item${picked.length !== 1 ? 's' : ''}:*\n${lines}\n\n_Reply *undo* to revert._`;
+    }
+
     const target = typeof data.index === 'number'
       ? unchecked[data.index - 1]
       : (bestMatches(data.item || '', items, x => x.item, 0.5)[0]?.item);
@@ -1221,6 +1496,30 @@ function handleShopping(intent, data, session) {
 
   if (intent === 'remove_shopping') {
     const unchecked = items.filter(i => !i.checked);
+
+    // ── Multi-index removal: { indices: [1,3,4] } ──
+    const indices = normaliseIndices(data.indices);
+    if (indices.length) {
+      const picked = indices.map(n => unchecked[n - 1]).filter(Boolean);
+      if (!picked.length) return `❌ None of those numbers match anything on the list.`;
+
+      const ids = new Set(picked.map(p => p.id));
+      const snapshot = picked.slice();
+      const kept = items.filter(i => !ids.has(i.id));
+      set('shopping', { items: kept });
+
+      session.lastAction = {
+        label: `Removed ${snapshot.length} shopping item(s)`,
+        undo: () => {
+          const cur = get('shopping').items || [];
+          set('shopping', { items: cur.concat(snapshot) });
+          return `Restored ${snapshot.length} shopping item${snapshot.length !== 1 ? 's' : ''}.`;
+        }
+      };
+      const lines = snapshot.map(t => `• ${t.item}`).join('\n');
+      return `🗑️ *Removed ${snapshot.length} item${snapshot.length !== 1 ? 's' : ''}:*\n${lines}\n\n_Reply *undo* to restore._`;
+    }
+
     const target = typeof data.index === 'number'
       ? unchecked[data.index - 1]
       : (bestMatches(data.item || '', items, x => x.item, 0.5)[0]?.item);
@@ -1397,7 +1696,6 @@ function buildSummary() {
     msg += '\n';
   }
 
-  // "Coming up soon" — pure date arithmetic, no TZ surprises.
   const todayAnchor = new Date(todayStr + 'T12:00:00Z');
   const soon = (calRec.events || []).filter(e => {
     if (!isValidYMD(e.date) || e.date <= todayStr) return false;
@@ -1451,8 +1749,6 @@ function buildSummary() {
 // ─────────────────────────────────────────────────────────────────
 function fmtDate(dateStr) {
   if (!dateStr) return '';
-  // Anchor at noon UTC so DST transitions can't shift the day,
-  // and pin the formatter to the display timezone.
   return new Date(dateStr + 'T12:00:00Z').toLocaleDateString('en-US', {
     weekday: 'short', month: 'short', day: 'numeric', year: 'numeric',
     timeZone: TZ,
@@ -1469,6 +1765,8 @@ const HELP_TEXT = `🤖 *Family Assistant — Commands:*
 • "Move the staff party to next Saturday"     ← reschedule
 • "Change dentist to 3pm"                     ← edit
 • "Show calendar" / "Remove dentist"
+• "Remove all dentist appointments"           ← bulk delete
+• "Remove all past piano lessons"             ← scoped bulk
 • "What's on this week?" / "Anything tomorrow?" ← date ranges
 
 📝 *To-Do*
@@ -1477,13 +1775,15 @@ const HELP_TEXT = `🤖 *Family Assistant — Commands:*
    - new cushions
    - new bedsheets"                            ← batch add
 • "Show to-do" / "Mark item 2 done"
-• "Remove item 1" / "Clear completed"
+• "Remove 1, 3, 4" / "Mark 2 and 4 done"       ← multi-pick
+• "Clear completed"
 
 🛒 *Shopping*
 • "Add milk, eggs and sourdough to shopping"
 • "Add 2 litres of oat milk to shopping"
 • "Show shopping" / "Check off item 3"
-• "Remove eggs" / "Clear shopping"
+• "Remove 1, 3, 4" / "Check off 2 and 4"       ← multi-pick
+• "Clear shopping"
 
 🍽️ *Meal Plan*
 • "Add spaghetti for Monday dinner"
@@ -1492,6 +1792,8 @@ const HELP_TEXT = `🤖 *Family Assistant — Commands:*
 💬 *Tip:* You can also *reply* to any list message with a command
 like "clear", "remove eggs", or "delete #2" — the bot picks up
 which list you're referring to.
+When picking from a numbered prompt, you can select several at
+once, e.g. "1,3" or "1-4".
 
 📊 *Other*
 • "Show summary" / "What's on today?"
