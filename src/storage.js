@@ -10,7 +10,6 @@ const DEFAULTS = {
     calendar: { events: [] },
     todo:     { items:  [] },
     shopping: { items:  [] },
-    meals:    { plan:   {} },
 };
 
 let cache       = null;   // in-memory mirror of data.json
@@ -60,7 +59,7 @@ function scheduleFlush() {
 
 function get(key) {
     const data = ensureLoaded();
-    return data[key] ?? clone(DEFAULTS[key] ?? {});
+    return clone(data[key] ?? DEFAULTS[key] ?? {});
 }
 
 function set(key, value) {

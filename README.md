@@ -18,24 +18,36 @@ Family WhatsApp AI assistant using OpenRouter and a local Node bot.
 
 ## Environment (`.env`)
 
-Create `.env` from `.env.example` or manually with at least:
+Create `.env` manually with at least:
 
 ```env
-OPENROUTER_API_KEY=<your_openrouter_api_key>
-WHATSAPP_GROUP_ID=<whatsapp_group_id>
-WHATSAPP_USER_IDS=<user_id_1>,<user_id_2>,...
-OTHER_SETTINGS=...
+OPENAI_API_KEY=<your_openrouter_api_key>
+OPENAI_BASE_URL=https://openrouter.ai/api/v1
+OPENAI_MODEL=<openrouter_model_slug>
+GROUP_CHAT_ID=<whatsapp_group_id>
+ALLOWED_NUMBERS=<number_1>,<number_2>,...
 ```
 
-- `WHATSAPP_GROUP_ID`: ID of the group chat the bot listens to.
-- `WHATSAPP_USER_IDS`: comma-separated user IDs for auth/mentions.
+- `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL`: passed straight to the OpenAI SDK, pointed
+  at OpenRouter's OpenAI-compatible endpoint.
+- `GROUP_CHAT_ID`: ID of the group chat the bot listens to (see below).
+- `ALLOWED_NUMBERS`: comma-separated phone numbers (digits only) allowed to issue commands.
+
+Optional:
+
+```env
+DAILY_REMINDER_CRON=0 7 * * *   # cron schedule for the daily summary (default shown)
+TZ=Asia/Hong_Kong               # timezone the cron schedule runs in
+TZ_DISPLAY=Asia/Hong_Kong       # timezone used when formatting dates/times in replies
+FALLBACK_PHONE_NUMBER=<number>  # daily summary target if GROUP_CHAT_ID isn't set
+```
 
 ## Getting WhatsApp group/user IDs
 
 ### Group IDs
 - For WhatsApp Cloud API: group ID is the `id` from group webhook events.
 - For self-hosted WhatsApp APIs: use group query endpoint (or inspect `messages` payload) for `chatId`.
-- Locally (whatsapp-web.js): run `node src/scripts/getgroups.js` and use output `"<group name>" => <groupId>`. Set `WHATSAPP_GROUP_ID` in `.env`.
+- Locally (whatsapp-web.js): run `node src/scripts/getgroups.js` and use output `"<group name>" => <groupId>`. Set `GROUP_CHAT_ID` in `.env`.
 
 ### User IDs
 - For WhatsApp Cloud API: user IDs appear as `from` in webhook events.
@@ -102,8 +114,8 @@ npm run start
 
 ## Quick validation
 
-- Confirm `OPENROUTER_API_KEY` is accessible from process.
-- Confirm bot receives WhatsApp webhook payloads and can parse `groupId`, `from` and text.
+- Confirm `OPENAI_API_KEY` is accessible from process.
+- Confirm bot receives WhatsApp messages and can parse `chatId`, `author`/`from` and text.
 
 ## Notes
 
