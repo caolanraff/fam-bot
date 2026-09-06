@@ -10,7 +10,6 @@ const DEFAULTS = {
     calendar: { events: [] },
     todo:     { items:  [] },
     shopping: { items:  [] },
-    meals:    { plan:   {} },
 };
 
 let cache       = null;   // in-memory mirror of data.json

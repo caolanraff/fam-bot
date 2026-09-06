@@ -12,10 +12,6 @@ const openai = new OpenAI({
 const ALLOWED = (process.env.ALLOWED_NUMBERS || '')
   .split(',').map(n => n.replace(/\D/g, '')).filter(Boolean);
 
-const DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
-const MEAL_EMOJI = { breakfast: '🌅', lunch: '☀️', dinner: '🌙' };
-const MEAL_TYPES = ['breakfast', 'lunch', 'dinner'];
-
 const PENDING_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 // Display timezone — defaults to Hong Kong. Override via env if you move.
@@ -292,11 +288,6 @@ async function dispatchIntent(intent, data, session, aiReply) {
     case 'view_shopping':
       return handleShopping(intent, data, session);
 
-    case 'add_meal':
-    case 'remove_meal':
-    case 'view_meals':
-      return handleMeals(intent, data, session);
-
     case 'summary': return buildSummary();
     case 'help':    return HELP_TEXT;
 
@@ -355,7 +346,7 @@ async function parseIntent(userMessage, session, senderName, quotedText = null) 
   };
 
   const systemPrompt = `You are a friendly family assistant WhatsApp bot for a couple.
-You manage their Calendar, To-Do List, Shopping List, and Meal Plan.
+You manage their Calendar, To-Do List, and Shopping List.
 The person messaging right now is: ${senderName}.
 Today is ${dayName}, ${todayStr} (timezone: ${TZ}).
 
@@ -428,11 +419,6 @@ Shopping
   clear_shopping  → {}
   view_shopping   → {}
 
-Meal Plan
-  add_meal    → { day, mealType ("breakfast"|"lunch"|"dinner"), food }
-  remove_meal → { day, mealType }
-  view_meals  → {}
-
 Other
   summary, help, confirm, cancel, undo, unknown → { }
 
@@ -446,7 +432,7 @@ When this happens:
 - Treat REPLYING_TO purely as context — it tells you which list/item the user
   is referring to. Do not re-parse the items inside it as new commands.
 - If REPLYING_TO starts with an emoji header, that identifies the list:
-    🛒 → shopping list   📝 → to-do list   📅 → calendar   🍽️ → meal plan
+    🛒 → shopping list   📝 → to-do list   📅 → calendar
 - Examples:
     REPLYING_TO: "🛒 Shopping List: ..."   USER_MESSAGE: "clear"
       → { "intent": "clear_shopping", "data": {} }
@@ -1588,103 +1574,6 @@ function handleShopping(intent, data, session) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Meal Plan
-// ─────────────────────────────────────────────────────────────────
-function handleMeals(intent, data, session) {
-  if (data.mealType) data.mealType = String(data.mealType).toLowerCase().trim();
-  if (data.day) {
-    const matched = DAYS.find(d => d.toLowerCase() === String(data.day).toLowerCase().trim());
-    if (matched) data.day = matched;
-  }
-
-  const rec  = get('meals');
-  const plan = rec.plan || {};
-
-  if (intent === 'add_meal') {
-    if (!DAYS.includes(data.day)) {
-      return `❌ Which day? Try: _"add pasta for Monday dinner"_`;
-    }
-    if (!MEAL_TYPES.includes(data.mealType)) {
-      return `❌ Meal type should be breakfast, lunch, or dinner.`;
-    }
-    if (!data.food || typeof data.food !== 'string') {
-      return `🤔 What's the meal? Try: _"add pasta for Monday dinner"_`;
-    }
-
-    const day = data.day;
-    const prev = plan[day]?.[data.mealType] || null;
-    if (!plan[day]) plan[day] = {};
-    plan[day][data.mealType] = data.food;
-    set('meals', { plan });
-
-    session.lastAction = {
-      label: `Set ${day} ${data.mealType}`,
-      undo: () => {
-        const cur = get('meals').plan || {};
-        if (prev === null) {
-          if (cur[day]) { delete cur[day][data.mealType]; if (!Object.keys(cur[day]).length) delete cur[day]; }
-        } else {
-          if (!cur[day]) cur[day] = {};
-          cur[day][data.mealType] = prev;
-        }
-        set('meals', { plan: cur });
-        return `Reverted ${day} ${data.mealType}.`;
-      }
-    };
-
-    const emoji = MEAL_EMOJI[data.mealType] || '🍽️';
-    const label = data.mealType.charAt(0).toUpperCase() + data.mealType.slice(1);
-    return `${emoji} *${label}* on *${day}:*\n${data.food}\n\n_Reply *undo* to revert._`;
-  }
-
-  if (intent === 'remove_meal') {
-    if (!DAYS.includes(data.day)) {
-      return `❌ Which day? Try: _"remove Monday dinner"_`;
-    }
-    if (!MEAL_TYPES.includes(data.mealType)) {
-      return `❌ Meal type should be breakfast, lunch, or dinner.`;
-    }
-    const day = data.day;
-    if (!plan[day]?.[data.mealType]) return `❌ No ${data.mealType} found for ${day}.`;
-    const removed = plan[day][data.mealType];
-    delete plan[day][data.mealType];
-    if (!Object.keys(plan[day]).length) delete plan[day];
-    set('meals', { plan });
-
-    session.lastAction = {
-      label: `Removed ${day} ${data.mealType}`,
-      undo: () => {
-        const cur = get('meals').plan || {};
-        if (!cur[day]) cur[day] = {};
-        cur[day][data.mealType] = removed;
-        set('meals', { plan: cur });
-        return `Restored ${day} ${data.mealType}: ${removed}.`;
-      }
-    };
-    return `🗑️ Removed ${data.mealType} (${removed}) from ${day}.\n\n_Reply *undo* to restore._`;
-  }
-
-  if (intent === 'view_meals') {
-    session.lastView = { type: 'meals' };
-    if (!Object.keys(plan).length) return `🍽️ Meal plan is empty!\n\nTry: _"Add pasta for Monday dinner"_`;
-    let msg = `🍽️ *Meal Plan:*\n\n`;
-    for (const day of DAYS) {
-      if (plan[day] && Object.keys(plan[day]).length) {
-        msg += `*${day}:*\n`;
-        for (const meal of MEAL_TYPES) {
-          if (plan[day][meal]) {
-            const label = meal.charAt(0).toUpperCase() + meal.slice(1);
-            msg += `  ${MEAL_EMOJI[meal]} ${label}: ${plan[day][meal]}\n`;
-          }
-        }
-        msg += '\n';
-      }
-    }
-    return msg.trim();
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────
 // Summary
 // ─────────────────────────────────────────────────────────────────
 function buildSummary() {
@@ -1694,7 +1583,6 @@ function buildSummary() {
   const calRec  = get('calendar');
   const todoRec = get('todo');
   const shopRec = get('shopping');
-  const mealRec = get('meals');
 
   let msg        = `🌅 *Good morning! ${dayName}, ${fmtDate(todayStr)}*\n\n`;
   let hasContent = false;
@@ -1726,19 +1614,6 @@ function buildSummary() {
     msg += `📝 *To-Do (${pending.length} pending):*\n`;
     pending.slice(0, 5).forEach(i => msg += `  • ${i.text}\n`);
     if (pending.length > 5) msg += `  _...and ${pending.length - 5} more_\n`;
-    msg += '\n';
-  }
-
-  const todayMeals = mealRec.plan?.[dayName];
-  if (todayMeals && Object.keys(todayMeals).length) {
-    hasContent = true;
-    msg += `🍽️ *Today's Meals:*\n`;
-    for (const m of MEAL_TYPES) {
-      if (todayMeals[m]) {
-        const label = m.charAt(0).toUpperCase() + m.slice(1);
-        msg += `  ${MEAL_EMOJI[m]} ${label}: ${todayMeals[m]}\n`;
-      }
-    }
     msg += '\n';
   }
 
@@ -1795,10 +1670,6 @@ const HELP_TEXT = `🤖 *Family Assistant — Commands:*
 • "Show shopping" / "Check off item 3"
 • "Remove 1, 3, 4" / "Check off 2 and 4"       ← multi-pick
 • "Clear shopping"
-
-🍽️ *Meal Plan*
-• "Add spaghetti for Monday dinner"
-• "Show meal plan" / "Remove Monday lunch"
 
 💬 *Tip:* You can also *reply* to any list message with a command
 like "clear", "remove eggs", or "delete #2" — the bot picks up
