@@ -60,7 +60,7 @@ function scheduleFlush() {
 
 function get(key) {
     const data = ensureLoaded();
-    return data[key] ?? clone(DEFAULTS[key] ?? {});
+    return clone(data[key] ?? DEFAULTS[key] ?? {});
 }
 
 function set(key, value) {

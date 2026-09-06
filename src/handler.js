@@ -186,6 +186,12 @@ async function processMessage(client, msg, session) {
         reply = '👍 Cancelled — pick aborted.';
         executedIntent = 'cancel';
         console.log('[bot] intent=cancel (fast-path)');
+      } else if (!session.pendingAction.fn && /^(yes|y|yep|yeah|sure|ok|okay|confirm|do it|go ahead)\b/.test(quick)) {
+        // Pure disambiguation prompt (no bulk "yes" option) — a number is required.
+        reply = `🤔 Please reply with the number of the one you meant, or say *cancel*.`;
+        executedIntent = 'pick_from_list';
+        traceNote = 'nudge_need_number';
+        console.log('[bot] intent=pick_from_list nudge (fast-path)');
       }
       // else: fall through — Fast Path 2 may still handle "yes"/"all"
       // for pending actions that also expose an fn (e.g. calendar bulk-remove).
@@ -246,13 +252,6 @@ async function processMessage(client, msg, session) {
     }
 
     if (!reply) reply = "Done! ✅";
-
-    if (!Array.isArray(session.history)) session.history = [];
-    session.history.push({ role: 'user',      content: userText });
-    session.history.push({ role: 'assistant', content: reply });
-    if (session.history.length > 40) {
-      session.history = session.history.slice(-40);
-    }
 
     pushTrace(session, userText, executedIntent, traceNote);
 
@@ -1402,8 +1401,9 @@ function handleShopping(intent, data, session) {
         i => i.item.toLowerCase() === itemText.toLowerCase() && !i.checked
       );
       if (existing) {
+        const prevQuantity = existing.quantity;
         if (quantity) existing.quantity = quantity;
-        added.push({ updated: true, item: itemText, quantity });
+        added.push({ updated: true, id: existing.id, prevQuantity, item: itemText, quantity });
       } else {
         const it = {
           id: newId(),
@@ -1426,9 +1426,20 @@ function handleShopping(intent, data, session) {
       label: `Added ${added.length} shopping item(s)`,
       undo: () => {
         const cur = get('shopping').items || [];
-        const ids = added.filter(a => !a.updated).map(a => a.ref.id);
-        set('shopping', { items: cur.filter(i => !ids.includes(i.id)) });
-        return `Removed ${ids.length} shopping item${ids.length !== 1 ? 's' : ''} (undo).`;
+        const newIds  = new Set(added.filter(a => !a.updated).map(a => a.ref.id));
+        const updates = added.filter(a => a.updated);
+        const kept = cur.filter(i => !newIds.has(i.id));
+        for (const u of updates) {
+          const t = kept.find(i => i.id === u.id);
+          if (t) t.quantity = u.prevQuantity;
+        }
+        set('shopping', { items: kept });
+
+        const parts = [];
+        if (newIds.size)   parts.push(`removed ${newIds.size} item${newIds.size !== 1 ? 's' : ''}`);
+        if (updates.length) parts.push(`reverted ${updates.length} quantity change${updates.length !== 1 ? 's' : ''}`);
+        const msg = parts.join(' and ') || 'nothing to undo';
+        return `${msg.charAt(0).toUpperCase()}${msg.slice(1)} (undo).`;
       }
     };
 

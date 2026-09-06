@@ -14,7 +14,7 @@ process.on('uncaughtException',  (e) => console.error('[fatal] uncaughtException
 
 // ─── Per-chat session store (IN-MEMORY ONLY) ───────────────────────
 // Sessions hold short-lived state: pending confirmations, undo closures,
-// recent conversation history. These contain JS functions (closures) that
+// and the classifier trace. These contain JS functions (closures) that
 // cannot be JSON-serialized, and resuming a "did you want to delete X?"
 // prompt after a restart would be confusing anyway. So sessions are
 // intentionally ephemeral and rebuilt fresh each run.
@@ -26,7 +26,6 @@ function getSession(chatId) {
       pendingAction: null,   // { fn, prompt, expiresAt? }
       lastAction:    null,   // { undo, description, ts }
       lastView:      null,   // last list shown, for "delete #2" style refs
-      history:       []      // recent messages, capped
     });
   }
   return sessions.get(chatId);
@@ -126,14 +125,6 @@ client.on('message_create', async (msg) => {
     console.log(`[msg] ${chatId} ${msg.author || 'self'}: ${msg.body}`);
 
     const session = getSession(chatId);
-    session.history.push({
-      role:   'user',
-      author: msg.author || 'self',
-      body:   msg.body,
-      ts:     Date.now()
-    });
-    if (session.history.length > 20) session.history.shift();
-
     await processMessage(client, msg, session);
   } catch (err) {
     console.error('[bot] message error:', err);
