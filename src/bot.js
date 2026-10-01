@@ -92,9 +92,22 @@ client.on('loading_screen', (percent, message) => {
 
 client.on('change_state', (state) => console.log(`[state] ${state}`));
 
+// Exit non-zero so pm2 restarts us with a fresh browser. Puppeteer kills
+// its Chromium child on process exit.
+function exitForRestart(reason) {
+  console.error(`[watchdog] ${reason} — exiting for pm2 restart`);
+  try { flushNow(); } catch (e) { console.error('[watchdog] flush failed:', e); }
+  process.exit(1);
+}
+
 client.on('ready', () => {
   isReady = true;
   console.log('🤖 Family assistant ready.');
+  // If Chromium dies, whatsapp-web.js doesn't emit 'disconnected', so
+  // watch the browser directly. Ignore it during our own destroy/reinit.
+  client.pupBrowser?.once('disconnected', () => {
+    if (!reconnecting) exitForRestart('browser disconnected');
+  });
 });
 
 client.on('disconnected', async (reason) => {
@@ -166,8 +179,45 @@ cron.schedule(cronSchedule, async () => {
 }, { timezone: cronTz });
 
 // ─── Heartbeat ─────────────────────────────────────────────────────
-setInterval(() => {
-  console.log(`[heartbeat] ready=${isReady} sessions=${sessions.size}`);
+// Probes the live WhatsApp Web page rather than trusting isReady, which
+// stays true if the browser/page dies without a 'disconnected' event.
+const HEALTH_TIMEOUT_MS   = 30_000;
+const MAX_HEALTH_FAILURES = 2;   // consecutive failed heartbeats before restart
+let healthFailures = 0;
+
+async function probeState() {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('getState timed out')), HEALTH_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([client.getState(), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+setInterval(async () => {
+  if (!isReady || reconnecting) {
+    console.log(`[heartbeat] ready=${isReady} sessions=${sessions.size}`);
+    return;
+  }
+  let state;
+  try {
+    state = await probeState();
+  } catch (err) {
+    state = `error: ${err.message}`;
+  }
+  console.log(`[heartbeat] ready=${isReady} state=${state} sessions=${sessions.size}`);
+
+  if (state === 'CONNECTED') {
+    healthFailures = 0;
+    return;
+  }
+  healthFailures++;
+  if (healthFailures >= MAX_HEALTH_FAILURES) {
+    exitForRestart(`unhealthy for ${healthFailures} heartbeats (state=${state})`);
+  }
 }, 5 * 60 * 1000);
 
 // ─── Graceful shutdown ─────────────────────────────────────────────
